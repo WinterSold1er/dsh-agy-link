@@ -341,6 +341,22 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     }
   })
 
+  // Child agent own-scope registration: registers agy_tool into the agent's
+  // own tool layer on creation so it bypasses toolFilter restrictions.
+  ctx.on('agent/created', ({ agent }) => {
+    const want = getConfig().enabled && bin() !== null
+    if (!want) return
+    const agentTools = agent?.ctx?.get?.('tools') ?? agent?.ctx?.tools
+    if (agentTools) {
+      try {
+        agentTools.register(defineAgyMirrorTool({ runs }))
+        log(`agy_tool mirror registered in agent scope [${agent.id}]`)
+      } catch (e) {
+        log(`failed to register agy_tool in agent scope [${agent.id}]: ${String(e)}`)
+      }
+    }
+  })
+
   // ---- HTTP surface for the client half ----
   // Registered through a reactive ctx.inject sub-fiber: at plugin load time
   // the webServer service may not exist yet (load-order race observed on
