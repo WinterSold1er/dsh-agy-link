@@ -319,3 +319,139 @@ test('resolveModel preserves 3.8 efforts, context window and max output tokens',
   assert.equal(resolved.reasoning?.defaultEffort, 'high')
 })
 
+test('ModelCatalog discovers models from CloudCode DiscoveredModelsResponse and merges with fallback', async () => {
+  let callCount = 0
+  const mockDiscover = async () => {
+    callCount++
+    return {
+      models: {
+        'gemini-3.8-flash-tiered': {
+          displayName: 'Gemini 3.8 Flash (Tiered)',
+          quotaInfo: { remainingFraction: 1, resetTime: '2026-04-10T12:00:00Z' },
+        },
+        'gemini-3.7-flash-tiered': {
+          displayName: 'Gemini 3.7 Flash (Tiered)',
+          quotaInfo: { remainingFraction: 0.8 },
+        },
+        'gemini-3.9-flash-tiered': {
+          displayName: 'Gemini 3.9 Flash (Tiered)',
+          quotaInfo: { remainingFraction: 1 },
+        },
+      },
+    }
+  }
+
+  const catalog = new ModelCatalog(mockDiscover, DEFAULT_FALLBACK_MODELS, 60_000)
+  assert.equal(catalog.get().source, 'fallback')
+
+  await catalog.refreshIfNeeded()
+  assert.equal(callCount, 1)
+  const cat = catalog.get()
+  assert.equal(cat.source, 'discovered')
+  assert.equal(cat.lastError, undefined)
+
+  // Discovered models are present with folded IDs & inferred efforts
+  const ids = cat.models.map((m) => m.id)
+  assert.ok(ids.includes('gemini-3.8-flash'), 'gemini-3.8-flash present')
+  assert.ok(ids.includes('gemini-3.7-flash'), 'gemini-3.7-flash present')
+  assert.ok(ids.includes('gemini-3.9-flash'), 'gemini-3.9-flash present')
+
+  const f38 = cat.models.find((m) => m.id === 'gemini-3.8-flash')
+  assert.equal(f38?.name, 'Gemini 3.8 Flash')
+  assert.deepEqual(f38?.efforts, ['low', 'medium', 'high'])
+
+  const f39 = cat.models.find((m) => m.id === 'gemini-3.9-flash')
+  assert.equal(f39?.name, 'Gemini 3.9 Flash')
+  assert.deepEqual(f39?.efforts, ['low', 'medium', 'high'])
+
+  // Fallback models not returned by discovery (Claude, GPT-OSS) are merged
+  assert.ok(ids.includes('claude-sonnet-4-6'), 'claude-sonnet-4-6 merged from fallback')
+  assert.ok(ids.includes('claude-opus-4-6-thinking'), 'claude-opus merged from fallback')
+  assert.ok(ids.includes('gpt-oss-120b-medium'), 'gpt-oss merged from fallback')
+
+  // No duplicate IDs
+  assert.equal(new Set(ids).size, ids.length, 'all catalog IDs must be unique')
+
+  // TTL: second refresh within TTL does not invoke discover
+  await catalog.refreshIfNeeded()
+  assert.equal(callCount, 1, 'TTL cache prevents redundant API calls')
+
+  // forceRefresh bypasses TTL
+  await catalog.forceRefresh()
+  assert.equal(callCount, 2, 'forceRefresh triggers discover')
+})
+
+test('ModelCatalog gracefully handles discover returning null or throwing error', async () => {
+  // 1. Discover returns null (e.g. not logged in)
+  const nullCatalog = new ModelCatalog(async () => null, DEFAULT_FALLBACK_MODELS, 60_000)
+  await nullCatalog.refreshIfNeeded()
+  assert.equal(nullCatalog.get().source, 'fallback')
+  assert.equal(nullCatalog.get().lastError, undefined)
+  assert.equal(nullCatalog.get().models.length, DEFAULT_FALLBACK_MODELS.length)
+
+  // 2. Discover throws error (e.g. network failure)
+  const errorCatalog = new ModelCatalog(
+    async () => {
+      throw new Error('Network timeout')
+    },
+    DEFAULT_FALLBACK_MODELS,
+    60_000,
+  )
+  await errorCatalog.refreshIfNeeded()
+  assert.equal(errorCatalog.get().source, 'fallback')
+  assert.equal(errorCatalog.get().lastError, 'Network timeout')
+  assert.equal(errorCatalog.get().models.length, DEFAULT_FALLBACK_MODELS.length)
+})
+
+test('AgyAdapter listModels and resolveModel with dynamic discovery', async () => {
+  const mockDiscover = async () => ({
+    models: {
+      'gemini-3.9-flash-tiered': {
+        displayName: 'Gemini 3.9 Flash (Tiered)',
+      },
+      'gemini-3.1-pro-tiered': {
+        displayName: 'Gemini 3.1 Pro (Tiered)',
+      },
+    },
+  })
+
+  const catalog = new ModelCatalog(mockDiscover, DEFAULT_FALLBACK_MODELS, 60_000)
+  const adapter = new AgyAdapter({
+    getConfig: () => defaultConfig(),
+    catalog,
+  })
+
+  const models = await adapter.listModels('antigravity')
+  assert.ok(models.some((m) => m.id === 'gemini-3.9-flash'))
+  assert.ok(models.some((m) => m.id === 'claude-sonnet-4-6'))
+
+  // Resolve dynamic gemini-3.9-flash
+  const resolved39 = await adapter.resolveModel('antigravity', 'gemini-3.9-flash')
+  assert.equal(resolved39.id, 'gemini-3.9-flash')
+  assert.equal(resolved39.name, 'Gemini 3.9 Flash')
+  assert.equal(resolved39.context?.contextWindow, 1_048_576)
+  assert.equal(resolved39.defaultMaxTokens, 65536)
+  assert.deepEqual(
+    resolved39.reasoning?.efforts?.map((e) => e.name),
+    ['low', 'medium', 'high'],
+  )
+
+  // Resolve dynamic gemini-3.1-pro
+  const resolvedPro = await adapter.resolveModel('antigravity', 'gemini-3.1-pro')
+  assert.deepEqual(
+    resolvedPro.reasoning?.efforts?.map((e) => e.name),
+    ['low', 'high'],
+  )
+
+  // Dynamic routing for 3.9
+  assert.equal(getAntigravityRequestModelId('gemini-3.9-flash', 'high'), 'gemini-3.9-flash-high')
+  assert.equal(getAntigravityRequestModelId('gemini-3.9-flash', 'low'), 'gemini-3.9-flash-low')
+  assert.equal(getAntigravityRequestModelId('gemini-3.9-flash', 'off'), 'gemini-3.9-flash-low')
+  assert.equal(getAntigravityRequestModelId('gemini-3.9-flash'), 'gemini-3.9-flash-low')
+
+  // findEntry handles -tiered query
+  const entry = findEntry(catalog.get(), 'gemini-3.9-flash-tiered')
+  assert.equal(entry?.id, 'gemini-3.9-flash')
+})
+
+

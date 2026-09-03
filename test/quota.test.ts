@@ -405,6 +405,64 @@ test('mergeFallbackFamilyQuota keeps last-known-good data over partial fallback'
   assert.equal(mergeFallbackFamilyQuota({ weeklyFraction: 0.5 }, partial), partial)
 })
 
+test('QuotaService discoverAvailableModels retrieves models using active candidate account or env token', async () => {
+  const origEnv = process.env.ANTIGRAVITY_TOKEN
+  delete process.env.ANTIGRAVITY_TOKEN
+
+  try {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-quota-discover-'))
+    const pool = new AccountPoolManager(dir)
+    // Clear default bootstrapped accounts so only our test account exists
+    for (const a of pool.getAccounts()) {
+      pool.deleteAccount(a.id)
+    }
+    const acc = pool.createAccountSlot('discover-acc')
+    pool.setPrimaryAccount(acc.id)
+
+    const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+    mkdirSync(tokenDir, { recursive: true })
+    writeFileSync(
+      join(tokenDir, 'antigravity-oauth-token'),
+      JSON.stringify({ access_token: 'ya29.discover_token', expiry: Date.now() + 3600_000 }),
+      'utf8',
+    )
+
+    let calledToken: string | null = null
+    class DiscoverQuotaService extends QuotaService {
+      override async fetchAvailableModels(token: string) {
+        calledToken = token
+        return {
+          models: {
+            'gemini-3.8-flash-tiered': { displayName: 'Gemini 3.8 Flash (Tiered)' },
+          },
+        }
+      }
+    }
+
+    const svc = new DiscoverQuotaService(pool)
+    const res = await svc.discoverAvailableModels()
+    assert.equal(calledToken, 'ya29.discover_token')
+    assert.ok(res?.models?.['gemini-3.8-flash-tiered'])
+
+    // Quarantined account is skipped
+    pool.markAuthRequired(acc.id, 'Invalid token')
+    const resQuarantined = await svc.discoverAvailableModels()
+    assert.equal(resQuarantined, null)
+
+    // Env token takes precedence
+    process.env.ANTIGRAVITY_TOKEN = 'ya29.env_override'
+    const resEnv = await svc.discoverAvailableModels()
+    assert.equal(calledToken, 'ya29.env_override')
+    assert.ok(resEnv?.models?.['gemini-3.8-flash-tiered'])
+  } finally {
+    if (origEnv !== undefined) {
+      process.env.ANTIGRAVITY_TOKEN = origEnv
+    } else {
+      delete process.env.ANTIGRAVITY_TOKEN
+    }
+  }
+})
+
 test('UI_PATHS contains all expected clean SVG paths', async () => {
   const { UI_PATHS } = await import('../src/client/brand-icons.ts')
   assert.ok(UI_PATHS.trash.length > 10)

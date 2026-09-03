@@ -430,6 +430,25 @@ export class QuotaService {
   }
 
   /**
+   * Automatically locate a valid account and fetch real-time available models from CloudCode.
+   */
+  async discoverAvailableModels(): Promise<DiscoveredModelsResponse | null> {
+    if (process.env.ANTIGRAVITY_TOKEN?.trim()) {
+      return this.fetchAvailableModels(process.env.ANTIGRAVITY_TOKEN.trim())
+    }
+    const poolData = this.pool.getPoolData()
+    const primaryAcc = poolData.primaryAccountId ? this.pool.getAccount(poolData.primaryAccountId) : undefined
+    const candidate = (primaryAcc && primaryAcc.enabled && !primaryAcc.authRequired)
+      ? primaryAcc
+      : this.pool.getAccounts().find((a) => a.enabled && !a.authRequired)
+
+    if (!candidate) return null
+    const accessToken = await this.getValidAccessToken(candidate)
+    if (!accessToken) return null
+    return this.fetchAvailableModels(accessToken, candidate.proxyUrl)
+  }
+
+  /**
    * Fetch and aggregate live quota statistics (both 5-hour limit and weekly limit)
    * for a single account across model families.
    * Includes 10s cache throttle to avoid spamming Google APIs on fast clicks.

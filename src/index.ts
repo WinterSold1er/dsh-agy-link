@@ -77,10 +77,13 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const semaphore = new Semaphore(() => getConfig().maxConcurrent)
 
   const catalog = new ModelCatalog(
-    undefined,
+    async () => quota.discoverAvailableModels(),
     getConfig().fallbackModels,
     getConfig().modelsCacheTtlMs,
   )
+
+  // Warm model cache in background if logged in
+  void catalog.refreshIfNeeded().catch(() => undefined)
 
   const auth = new AuthHelper(pool, quota)
   const poolAuth = new PoolAuthFlow(pool, quota, log)

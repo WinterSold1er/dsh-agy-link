@@ -4,9 +4,22 @@
 // stay verbatim with no effort toggle, matching observed agy behavior
 // (agy rejects --effort for Claude/GPT-OSS). Discovery failure falls back to
 // a bundled catalog so the /model picker is never empty.
-import type { FallbackModelDef, PluginConfig } from '../common/types.ts'
+import { DEFAULT_FALLBACK_MODELS, type FallbackModelDef, type PluginConfig } from '../common/types.ts'
 
 export interface RawModel { slug: string; label: string }
+
+export interface DiscoveredModelEntry {
+  quotaInfo?: {
+    remainingFraction?: number
+    resetTime?: string
+  }
+  displayName?: string
+  modelName?: string
+}
+
+export interface DiscoveredModelsResponse {
+  models?: Record<string, DiscoveredModelEntry>
+}
 
 export interface CatalogEntry {
   id: string
@@ -66,6 +79,21 @@ function extractModelList(parsed: unknown): RawModel[] | null {
   if (Array.isArray(parsed)) arr = parsed;
   else if (parsed && typeof parsed === 'object') {
     const o = parsed as Record<string, unknown>
+    if (o.models && typeof o.models === 'object' && !Array.isArray(o.models)) {
+      const out: RawModel[] = []
+      for (const [key, val] of Object.entries(o.models as Record<string, unknown>)) {
+        if (!key || typeof key !== 'string') continue
+        const v = (val && typeof val === 'object' ? val : {}) as Record<string, unknown>
+        const label =
+          (typeof v.displayName === 'string' && v.displayName.trim() !== '') ? v.displayName.trim()
+          : (typeof v.display_name === 'string' && v.display_name.trim() !== '') ? v.display_name.trim()
+          : (typeof v.modelName === 'string' && v.modelName.trim() !== '') ? v.modelName.trim()
+          : (typeof v.name === 'string' && v.name.trim() !== '') ? v.name.trim()
+          : key
+        out.push({ slug: key.trim(), label })
+      }
+      return out
+    }
     for (const k of ['models', 'items', 'data', 'result']) {
       if (Array.isArray(o[k])) {
         arr = o[k] as unknown[];
@@ -93,6 +121,21 @@ function extractModelList(parsed: unknown): RawModel[] | null {
 
 const EFFORT_SUFFIXES = ['low', 'medium', 'high']
 
+export function deriveEffortsForModel(modelId: string): string[] | null {
+  const id = modelId.toLowerCase()
+  if (id === 'gemini-3.1-pro' || id.startsWith('gemini-3.1-pro')) {
+    return ['low', 'high']
+  }
+  if (id.startsWith('gemini-3.')) {
+    return ['low', 'medium', 'high']
+  }
+  return null
+}
+
+function stripTieredLabel(label: string): string {
+  return label.replace(/\s*\((?:Tiered|tiered)\)\s*$/i, '').replace(/\s+(?:Tiered|tiered)\s*$/i, '').trim()
+}
+
 /** Fold Gemini effort variants into base + effort set (spec ADR-10). */
 export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
   const bases = new Map<string, { label: string; efforts: Set<string> }>()
@@ -103,6 +146,22 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
       verbatim.push({ id: r.slug, name: r.label, efforts: null });
       continue;
     }
+
+    if (r.slug.endsWith('-tiered')) {
+      const base = r.slug.slice(0, -7)
+      const inferredEfforts = deriveEffortsForModel(base)
+      const cleanLabel = stripTieredLabel(r.label)
+      const entry = bases.get(base) ?? {
+        label: cleanLabel !== '' ? cleanLabel : base,
+        efforts: new Set<string>(),
+      }
+      if (inferredEfforts) {
+        for (const eff of inferredEfforts) entry.efforts.add(eff)
+      }
+      bases.set(base, entry)
+      continue
+    }
+
     let folded = false
     for (const eff of EFFORT_SUFFIXES) {
       const suffix = '-' + eff;
@@ -166,20 +225,56 @@ export function buildFallbackCatalog(defs: readonly FallbackModelDef[]): Catalog
 // ---------------------------------------------------------------------------
 // Catalog cache with TTL + stale-while-revalidate (pi-bridge pattern).
 
-export type DiscoverFn = (signal?: AbortSignal) => Promise<{ stdout: string; stderr: string }>
+export type DiscoverResult =
+  | DiscoveredModelsResponse
+  | RawModel[]
+  | { stdout: string; stderr?: string }
+  | null
+  | undefined
+
+export type DiscoverFn = (signal?: AbortSignal) => Promise<DiscoverResult>
+
+export function mergeDiscoveredWithFallback(
+  discovered: readonly CatalogEntry[],
+  fallbackDefs: readonly FallbackModelDef[] = DEFAULT_FALLBACK_MODELS,
+): CatalogEntry[] {
+  const fallbackEntries = buildFallbackCatalog(fallbackDefs)
+  if (discovered.length === 0) return fallbackEntries
+
+  const existingIds = new Set<string>()
+  for (const e of discovered) {
+    existingIds.add(e.id.toLowerCase())
+    const resolved = resolveModelSlug(e.id).toLowerCase()
+    existingIds.add(resolved)
+  }
+
+  const result = [...discovered]
+  for (const fb of fallbackEntries) {
+    const fbId = fb.id.toLowerCase()
+    const resolvedFbId = resolveModelSlug(fb.id).toLowerCase()
+    if (!existingIds.has(fbId) && !existingIds.has(resolvedFbId)) {
+      result.push(fb)
+      existingIds.add(fbId)
+      existingIds.add(resolvedFbId)
+    }
+  }
+  return result
+}
 
 export class ModelCatalog {
   private current: Catalog;
   private refreshing: Promise<void> | null = null;
   private readonly discover?: DiscoverFn;
+  private readonly fallbackDefs: readonly FallbackModelDef[];
   private readonly ttlMs: number;
 
   constructor(
     discover?: DiscoverFn,
-    fallbackDefs: readonly FallbackModelDef[] = [],
+    fallbackDefs: readonly FallbackModelDef[] = DEFAULT_FALLBACK_MODELS,
     ttlMs: number = 300_000,
   ) {
     this.discover = discover;
+    this.fallbackDefs = fallbackDefs;
     this.ttlMs = ttlMs;
     this.current = {
       source: 'fallback',
@@ -216,10 +311,29 @@ export class ModelCatalog {
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), 30_000);
       try {
-        const { stdout } = await this.discover(ac.signal);
-        const raw = parseModelsOutput(stdout);
+        const res = await this.discover(ac.signal);
+        if (res == null) {
+          if (this.current.source === 'fallback') {
+            const { lastError: _, ...rest } = this.current;
+            this.current = rest;
+          }
+          return;
+        }
+
+        let raw: RawModel[] = []
+        if (typeof res === 'object' && 'stdout' in res && typeof res.stdout === 'string') {
+          raw = parseModelsOutput(res.stdout);
+        } else if (Array.isArray(res)) {
+          raw = dedupeBySlug(res);
+        } else if (typeof res === 'object' && 'models' in res) {
+          const list = extractModelList(res);
+          if (list) raw = dedupeBySlug(list);
+        }
+
         if (raw.length > 0) {
-          this.current = { source: 'discovered', models: foldEfforts(raw), discoveredAt: Date.now() };
+          const folded = foldEfforts(raw);
+          const merged = mergeDiscoveredWithFallback(folded, this.fallbackDefs);
+          this.current = { source: 'discovered', models: merged, discoveredAt: Date.now() };
           return;
         }
         if (this.current.source === 'fallback') {
@@ -227,7 +341,7 @@ export class ModelCatalog {
           this.current = rest;
           return;
         }
-        this.current = { ...this.current, lastError: 'agy models returned no entries' };
+        this.current = { ...this.current, lastError: 'models discovery returned no entries' };
       } finally {
         clearTimeout(timer);
       }
@@ -268,7 +382,13 @@ export function findEntry(catalog: Catalog, id: string): CatalogEntry | undefine
   if (direct) return direct;
   const resolved = resolveModelSlug(id);
   if (resolved !== id) {
-    return catalog.models.find((m) => m.id === resolved);
+    const directResolved = catalog.models.find((m) => m.id === resolved);
+    if (directResolved) return directResolved;
+  }
+  if (id.endsWith('-tiered')) {
+    const base = id.slice(0, -7);
+    const baseEntry = catalog.models.find((m) => m.id === base);
+    if (baseEntry) return baseEntry;
   }
   return undefined;
 }
@@ -434,7 +554,23 @@ export function getMaxOutputTokens(modelId: string, runtimeModel?: string): numb
 export function getAntigravityRequestModelId(modelId: string, effort?: string): string {
   const resolvedId = resolveModelSlug(modelId)
   const r = ANTIGRAVITY_ROUTING[resolvedId] ?? ANTIGRAVITY_ROUTING[modelId]
-  if (!r) return resolvedId
+  if (!r) {
+    const isWireModel =
+      resolvedId.endsWith('-low') ||
+      resolvedId.endsWith('-medium') ||
+      resolvedId.endsWith('-high') ||
+      resolvedId.endsWith('-tiered') ||
+      resolvedId.endsWith('-extra-low') ||
+      resolvedId.endsWith('-thinking')
+    if (resolvedId.startsWith('gemini-3.') && !isWireModel) {
+      if (effort && effort !== 'off' && ['low', 'medium', 'high', 'xhigh'].includes(effort.toLowerCase())) {
+        const eff = effort.toLowerCase() === 'xhigh' ? 'high' : effort.toLowerCase()
+        return `${resolvedId}-${eff}`
+      }
+      return `${resolvedId}-low`
+    }
+    return resolvedId
+  }
 
   if (effort === undefined || effort === 'off' || effort === '') {
     return r.off ?? r.routing?.minimal ?? r.routing?.low ?? r.defaultRequestId ?? resolvedId

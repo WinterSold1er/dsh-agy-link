@@ -329,6 +329,19 @@ function extractModelList(parsed) {
 	if (Array.isArray(parsed)) arr = parsed;
 	else if (parsed && typeof parsed === "object") {
 		const o = parsed;
+		if (o.models && typeof o.models === "object" && !Array.isArray(o.models)) {
+			const out = [];
+			for (const [key, val] of Object.entries(o.models)) {
+				if (!key || typeof key !== "string") continue;
+				const v = val && typeof val === "object" ? val : {};
+				const label = typeof v.displayName === "string" && v.displayName.trim() !== "" ? v.displayName.trim() : typeof v.display_name === "string" && v.display_name.trim() !== "" ? v.display_name.trim() : typeof v.modelName === "string" && v.modelName.trim() !== "" ? v.modelName.trim() : typeof v.name === "string" && v.name.trim() !== "" ? v.name.trim() : key;
+				out.push({
+					slug: key.trim(),
+					label
+				});
+			}
+			return out;
+		}
 		for (const k of [
 			"models",
 			"items",
@@ -365,6 +378,19 @@ const EFFORT_SUFFIXES = [
 	"medium",
 	"high"
 ];
+function deriveEffortsForModel(modelId) {
+	const id = modelId.toLowerCase();
+	if (id === "gemini-3.1-pro" || id.startsWith("gemini-3.1-pro")) return ["low", "high"];
+	if (id.startsWith("gemini-3.")) return [
+		"low",
+		"medium",
+		"high"
+	];
+	return null;
+}
+function stripTieredLabel(label) {
+	return label.replace(/\s*\((?:Tiered|tiered)\)\s*$/i, "").replace(/\s+(?:Tiered|tiered)\s*$/i, "").trim();
+}
 /** Fold Gemini effort variants into base + effort set (spec ADR-10). */
 function foldEfforts(raw) {
 	const bases = /* @__PURE__ */ new Map();
@@ -377,6 +403,18 @@ function foldEfforts(raw) {
 				name: r.label,
 				efforts: null
 			});
+			continue;
+		}
+		if (r.slug.endsWith("-tiered")) {
+			const base = r.slug.slice(0, -7);
+			const inferredEfforts = deriveEffortsForModel(base);
+			const cleanLabel = stripTieredLabel(r.label);
+			const entry = bases.get(base) ?? {
+				label: cleanLabel !== "" ? cleanLabel : base,
+				efforts: /* @__PURE__ */ new Set()
+			};
+			if (inferredEfforts) for (const eff of inferredEfforts) entry.efforts.add(eff);
+			bases.set(base, entry);
 			continue;
 		}
 		let folded = false;
@@ -434,13 +472,36 @@ function buildFallbackCatalog(defs) {
 		efforts: Array.isArray(d.efforts) && d.efforts.length > 0 ? d.efforts.filter((e) => typeof e === "string" && e.trim() !== "") : null
 	}));
 }
+function mergeDiscoveredWithFallback(discovered, fallbackDefs = DEFAULT_FALLBACK_MODELS) {
+	const fallbackEntries = buildFallbackCatalog(fallbackDefs);
+	if (discovered.length === 0) return fallbackEntries;
+	const existingIds = /* @__PURE__ */ new Set();
+	for (const e of discovered) {
+		existingIds.add(e.id.toLowerCase());
+		const resolved = resolveModelSlug(e.id).toLowerCase();
+		existingIds.add(resolved);
+	}
+	const result = [...discovered];
+	for (const fb of fallbackEntries) {
+		const fbId = fb.id.toLowerCase();
+		const resolvedFbId = resolveModelSlug(fb.id).toLowerCase();
+		if (!existingIds.has(fbId) && !existingIds.has(resolvedFbId)) {
+			result.push(fb);
+			existingIds.add(fbId);
+			existingIds.add(resolvedFbId);
+		}
+	}
+	return result;
+}
 var ModelCatalog = class {
 	current;
 	refreshing = null;
 	discover;
+	fallbackDefs;
 	ttlMs;
-	constructor(discover, fallbackDefs = [], ttlMs = 3e5) {
+	constructor(discover, fallbackDefs = DEFAULT_FALLBACK_MODELS, ttlMs = 3e5) {
 		this.discover = discover;
+		this.fallbackDefs = fallbackDefs;
 		this.ttlMs = ttlMs;
 		this.current = {
 			source: "fallback",
@@ -473,12 +534,26 @@ var ModelCatalog = class {
 			const ac = new AbortController();
 			const timer = setTimeout(() => ac.abort(), 3e4);
 			try {
-				const { stdout } = await this.discover(ac.signal);
-				const raw = parseModelsOutput(stdout);
+				const res = await this.discover(ac.signal);
+				if (res == null) {
+					if (this.current.source === "fallback") {
+						const { lastError: _, ...rest } = this.current;
+						this.current = rest;
+					}
+					return;
+				}
+				let raw = [];
+				if (typeof res === "object" && "stdout" in res && typeof res.stdout === "string") raw = parseModelsOutput(res.stdout);
+				else if (Array.isArray(res)) raw = dedupeBySlug(res);
+				else if (typeof res === "object" && "models" in res) {
+					const list = extractModelList(res);
+					if (list) raw = dedupeBySlug(list);
+				}
 				if (raw.length > 0) {
+					const merged = mergeDiscoveredWithFallback(foldEfforts(raw), this.fallbackDefs);
 					this.current = {
 						source: "discovered",
-						models: foldEfforts(raw),
+						models: merged,
 						discoveredAt: Date.now()
 					};
 					return;
@@ -490,7 +565,7 @@ var ModelCatalog = class {
 				}
 				this.current = {
 					...this.current,
-					lastError: "agy models returned no entries"
+					lastError: "models discovery returned no entries"
 				};
 			} finally {
 				clearTimeout(timer);
@@ -514,7 +589,15 @@ function findEntry(catalog, id) {
 	const direct = catalog.models.find((m) => m.id === id);
 	if (direct) return direct;
 	const resolved = resolveModelSlug(id);
-	if (resolved !== id) return catalog.models.find((m) => m.id === resolved);
+	if (resolved !== id) {
+		const directResolved = catalog.models.find((m) => m.id === resolved);
+		if (directResolved) return directResolved;
+	}
+	if (id.endsWith("-tiered")) {
+		const base = id.slice(0, -7);
+		const baseEntry = catalog.models.find((m) => m.id === base);
+		if (baseEntry) return baseEntry;
+	}
 }
 function defaultEffortFor(entry, cfg) {
 	if (!entry.efforts || entry.efforts.length === 0) return void 0;
@@ -663,7 +746,19 @@ function getMaxOutputTokens(modelId, runtimeModel) {
 function getAntigravityRequestModelId(modelId, effort) {
 	const resolvedId = resolveModelSlug(modelId);
 	const r = ANTIGRAVITY_ROUTING[resolvedId] ?? ANTIGRAVITY_ROUTING[modelId];
-	if (!r) return resolvedId;
+	if (!r) {
+		const isWireModel = resolvedId.endsWith("-low") || resolvedId.endsWith("-medium") || resolvedId.endsWith("-high") || resolvedId.endsWith("-tiered") || resolvedId.endsWith("-extra-low") || resolvedId.endsWith("-thinking");
+		if (resolvedId.startsWith("gemini-3.") && !isWireModel) {
+			if (effort && effort !== "off" && [
+				"low",
+				"medium",
+				"high",
+				"xhigh"
+			].includes(effort.toLowerCase())) return `${resolvedId}-${effort.toLowerCase() === "xhigh" ? "high" : effort.toLowerCase()}`;
+			return `${resolvedId}-low`;
+		}
+		return resolvedId;
+	}
 	if (effort === void 0 || effort === "off" || effort === "") return r.off ?? r.routing?.minimal ?? r.routing?.low ?? r.defaultRequestId ?? resolvedId;
 	const effortKey = effort.toLowerCase();
 	return r.routing?.[effortKey] ?? r.routing?.high ?? r.routing?.low ?? r.routing?.minimal ?? r.off ?? r.defaultRequestId ?? resolvedId;
@@ -27032,6 +27127,19 @@ var QuotaService = class {
 		return null;
 	}
 	/**
+	* Automatically locate a valid account and fetch real-time available models from CloudCode.
+	*/
+	async discoverAvailableModels() {
+		if (process.env.ANTIGRAVITY_TOKEN?.trim()) return this.fetchAvailableModels(process.env.ANTIGRAVITY_TOKEN.trim());
+		const poolData = this.pool.getPoolData();
+		const primaryAcc = poolData.primaryAccountId ? this.pool.getAccount(poolData.primaryAccountId) : void 0;
+		const candidate = primaryAcc && primaryAcc.enabled && !primaryAcc.authRequired ? primaryAcc : this.pool.getAccounts().find((a) => a.enabled && !a.authRequired);
+		if (!candidate) return null;
+		const accessToken = await this.getValidAccessToken(candidate);
+		if (!accessToken) return null;
+		return this.fetchAvailableModels(accessToken, candidate.proxyUrl);
+	}
+	/**
 	* Fetch and aggregate live quota statistics (both 5-hour limit and weekly limit)
 	* for a single account across model families.
 	* Includes 10s cache throttle to avoid spamming Google APIs on fast clicks.
@@ -27197,7 +27305,8 @@ function apply(ctx, entryConfig = {}) {
 	const pool = new AccountPoolManager();
 	const quota = new QuotaService(pool);
 	const semaphore = new Semaphore(() => getConfig().maxConcurrent);
-	const catalog = new ModelCatalog(void 0, getConfig().fallbackModels, getConfig().modelsCacheTtlMs);
+	const catalog = new ModelCatalog(async () => quota.discoverAvailableModels(), getConfig().fallbackModels, getConfig().modelsCacheTtlMs);
+	catalog.refreshIfNeeded().catch(() => void 0);
 	const auth = new AuthHelper(pool, quota);
 	const poolAuth = new PoolAuthFlow(pool, quota, log);
 	const swept = pool.sweepStaleStaging();
