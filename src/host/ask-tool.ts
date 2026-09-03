@@ -1,10 +1,7 @@
-// agy_ask — the AskAntigravity equivalent (spec P1 / M7): a one-shot
-// delegation tool so any DSH model can consult an Antigravity model. Alias
-// resolution mirrors the pi bridge (flash / pro / gemini / sonnet / opus /
-// gpt-oss plus exact slugs, newest version wins, effort nearest-match).
+// agy_ask — one-shot delegation tool so any DSH model can consult an Antigravity model.
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Catalog } from './models.ts'
-import { defaultEffortFor, findEntry } from './models.ts'
+import { findEntry } from './models.ts'
 import type { OneShotDeps } from './oneshot.ts'
 import { runAgyOnce } from './oneshot.ts'
 
@@ -19,7 +16,6 @@ const ALIASES: Readonly<Record<string, string>> = {
   oss: 'gpt-oss',
 }
 
-/** Resolve a user-facing model word against the live catalog. */
 export function resolveAskModel(
   input: string,
   catalog: Catalog,
@@ -64,7 +60,7 @@ function compareNatural(a: string, b: string): number {
 export function defineAgyAskTool(deps: OneShotDeps & { catalog: () => Catalog }) {
   return defineTool({
     name: 'agy_ask',
-    description: 'Delegate a one-shot task to a Google Antigravity model via the agy CLI (e.g. ask Gemini for a review while keeping the current model). Returns the final answer text.',
+    description: 'Delegate a one-shot task to a Google Antigravity model via direct CloudCode API. Returns the final answer text.',
     parameters: {
       prompt: {
         type: 'string',
@@ -81,7 +77,7 @@ export function defineAgyAskTool(deps: OneShotDeps & { catalog: () => Catalog })
       },
       mode: {
         type: 'string',
-        description: 'agy execution mode: plan (read-only) or accept-edits. Defaults to the bridge permission mode.',
+        description: 'Execution mode (optional).',
       },
       timeoutMinutes: {
         type: 'number',
@@ -93,7 +89,7 @@ export function defineAgyAskTool(deps: OneShotDeps & { catalog: () => Catalog })
       },
       schema: {
         type: 'string',
-        description: 'Optional JSON Schema (as a JSON string) enforcing the final answer via agy --json-schema.',
+        description: 'Optional JSON Schema enforcing the final answer.',
       },
     },
     output: {
@@ -102,7 +98,6 @@ export function defineAgyAskTool(deps: OneShotDeps & { catalog: () => Catalog })
     },
     timeoutMs: 15 * 60_000,
     async execute(args, exec) {
-      void exec.signal;
       const cfg = deps.cfg()
       const model = resolveAskModel(args.model ?? '', deps.catalog(), cfg.defaultModel)
       let parsedSchema: unknown
@@ -116,24 +111,26 @@ export function defineAgyAskTool(deps: OneShotDeps & { catalog: () => Catalog })
       const readPaths = typeof args.readPaths === 'string' && args.readPaths.trim() !== ''
         ? args.readPaths.split(/[ ,]+/).filter(Boolean)
         : []
-      // Effort defaults to the bridge default (high-first) for effort models.
-      const entry = findEntry(deps.catalog(), model)
-      const effort = args.effort ?? (entry?.efforts ? defaultEffortFor(entry, cfg) : undefined)
+
+      const effort = args.effort
+
       const res = await runAgyOnce(deps, {
         prompt: args.prompt,
-        model: model === '' ? undefined : model,
+        model,
         effort,
         mode: args.mode,
-        timeoutMs: args.timeoutMinutes ? args.timeoutMinutes * 60_000 : undefined,
+        timeoutMs: typeof args.timeoutMinutes === 'number' && args.timeoutMinutes > 0
+          ? args.timeoutMinutes * 60_000
+          : undefined,
         signal: exec.signal,
         readPaths,
         schema: parsedSchema,
       })
+
       if (!res.ok) {
-        throw new Error('agy_ask failed: ' + (res.error ?? 'unknown error'))
+        throw new Error(res.error || 'agy_ask failed')
       }
-      const footer = res.conversationId ? '\n\n(agy conversation: ' + res.conversationId + ' — continue it with: agy --conversation ' + res.conversationId + ')' : ''
-      return res.text + footer + '\n(' + Math.round(res.durationMs / 100) / 10 + 's)'
+      return res.text
     },
   })
 }

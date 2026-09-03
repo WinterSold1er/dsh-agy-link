@@ -1,6 +1,5 @@
 // Shared vocabulary for dsh-agy-link: plugin config, provider-route ids,
-// stable error codes, and the normalized event stream produced by the
-// stream-json parser and consumed by the StreamChunk mapper.
+// stable error codes, and the CloudCode direct API types.
 
 export const PROVIDER_ID = 'antigravity'
 export const PLUGIN_ID = 'agy-link'
@@ -17,56 +16,69 @@ export interface FallbackModelDef {
 
 export interface PluginConfig {
   enabled: boolean
-  /** Absolute path to the agy binary; empty string = resolve from PATH. */
-  agyBin: string
-  /** Extra argv appended to every spawn (escape hatch). */
-  extraArgs: readonly string[]
-  permissionMode: PermissionMode
   defaultModel: string
   defaultEffort: string
-  /** Watchdog for one full agy -p run. */
+  /** Watchdog for one generation call. */
   timeoutMs: number
   maxConcurrent: number
   contextWindowDefault: number
   maxTokensDefault: number
-  forwardSystemPrompt: boolean
-  digestMaxChars: number
-  modelsCacheTtlMs: number
-  /** Allow compaction / session-title auxiliary calls to spawn agy. */
-  allowAuxiliary: boolean
-  /** Hard character cap for compaction prompts built from history. */
-  compactionMaxChars: number
-  /** Lock the working directory for agy spawns; empty string = process.cwd(). */
-  workspaceRoot: string
+  /** Background quota polling interval in ms (default 15 min; clamped >= 60s). */
+  quotaPollIntervalMs: number
   fallbackModels: readonly FallbackModelDef[]
   askTool: boolean
-  /** Directory where inbound images are staged for agy (path-based multimodal). */
-  mediaDir: string
-  /** Images older than this are swept from mediaDir. */
-  mediaTtlMs: number
-  /** Per-image byte cap for staging; larger images are skipped with a note. */
-  mediaMaxBytes: number
-  /** Max images staged per model call. */
-  mediaMaxImages: number
-  /** Experimental: expose DSH tools to agy over a local MCP bridge. */
-  mcpBridge: boolean
-  /** Comma-separated tool-name allowlist for the MCP bridge (empty = all non-internal). */
-  mcpToolAllowlist: string
-  /** Maximum requests allowed per minute across all sessions (0 = disabled). */
-  rateLimitPerMinute: number
-  /** Automatically fallback to available lower-tier model if active model is exhausted. */
-  autoFallbackModel: boolean
-  /** Days to retain historical agy CLI log files before automatic sweep (default: 7). */
-  logRetentionDays: number
   /** Opt-out and suppress Google Cloud Code / Antigravity telemetry tracking. */
   disableTelemetry: boolean
-  /** Background quota polling interval in ms (default 15 min; clamped >= 60s). Lower = more risk-control exposure. */
-  quotaPollIntervalMs: number
+  /** Automatically fallback to available lower-tier model if active model is exhausted. */
+  autoFallbackModel: boolean
+  /** Custom base URL for CloudCode API (empty = default). */
+  baseUrl: string
+  /** Candidate endpoints for fallback. */
+  endpointCandidates: readonly string[]
+  modelsCacheTtlMs: number
+  /** Days to retain historical logs before automatic sweep (default: 7). */
+  logRetentionDays: number
+  /** Maximum requests allowed per minute across all sessions (0 = disabled). */
+  rateLimitPerMinute: number
+
+  // Deprecated configuration options (kept for backwards compatibility, silently ignored):
+  /** @deprecated Use direct CloudCode API instead of agy binary */
+  agyBin?: string
+  /** @deprecated Permission mode was used for agy CLI */
+  permissionMode?: PermissionMode
+  /** @deprecated Workspace root was used for agy CLI */
+  workspaceRoot?: string
+  /** @deprecated MCP bridge was used for agy CLI */
+  mcpBridge?: boolean
+  /** @deprecated */
+  mcpToolAllowlist?: string
+  /** @deprecated */
+  mediaDir?: string
+  /** @deprecated */
+  mediaTtlMs?: number
+  /** @deprecated */
+  mediaMaxBytes?: number
+  /** @deprecated */
+  mediaMaxImages?: number
+  /** @deprecated */
+  forwardSystemPrompt?: boolean
+  /** @deprecated */
+  digestMaxChars?: number
+  /** @deprecated */
+  allowAuxiliary?: boolean
+  /** @deprecated */
+  compactionMaxChars?: number
+  /** @deprecated */
+  extraArgs?: readonly string[]
 }
 
-// Full fallback line-up, mined from the agy 1.1.13 binary. Serves the
-// picker when agy models cannot run (signed out / offline); the live list
-// always comes from `agy models` once signed in.
+export const DEFAULT_ENDPOINT_CANDIDATES: readonly string[] = [
+  'https://daily-cloudcode-pa.googleapis.com',
+  'https://daily-cloudcode-pa.sandbox.googleapis.com',
+  'https://cloudcode-pa.googleapis.com',
+]
+
+// Full fallback line-up
 export const DEFAULT_FALLBACK_MODELS: readonly FallbackModelDef[] = [
   { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', efforts: ['low', 'medium', 'high'] },
   { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', efforts: ['low', 'medium', 'high'] },
@@ -80,131 +92,55 @@ export const DEFAULT_FALLBACK_MODELS: readonly FallbackModelDef[] = [
 export function defaultConfig(): PluginConfig {
   return {
     enabled: true,
-    agyBin: '',
-    extraArgs: [],
-    permissionMode: 'skip',
     defaultModel: '',
     defaultEffort: '',
     timeoutMs: 600_000,
     maxConcurrent: 3,
     contextWindowDefault: 1_048_576,
     maxTokensDefault: 65_536,
-    forwardSystemPrompt: false,
-    digestMaxChars: 8_000,
-    modelsCacheTtlMs: 300_000,
-    allowAuxiliary: true,
-    compactionMaxChars: 800_000,
-    workspaceRoot: '',
+    quotaPollIntervalMs: 15 * 60_000,
     fallbackModels: DEFAULT_FALLBACK_MODELS,
     askTool: false,
+    disableTelemetry: true,
+    autoFallbackModel: false,
+    baseUrl: '',
+    endpointCandidates: DEFAULT_ENDPOINT_CANDIDATES,
+    modelsCacheTtlMs: 300_000,
+    logRetentionDays: 7,
+    rateLimitPerMinute: 0,
+    agyBin: '',
+    permissionMode: 'skip',
+    workspaceRoot: '',
+    mcpBridge: false,
+    mcpToolAllowlist: '',
     mediaDir: '',
     mediaTtlMs: 86_400_000,
     mediaMaxBytes: 10 * 1024 * 1024,
     mediaMaxImages: 8,
-    mcpBridge: false,
-    mcpToolAllowlist: '',
-    rateLimitPerMinute: 0,
-    autoFallbackModel: false,
-    logRetentionDays: 7,
-    disableTelemetry: true,
-    quotaPollIntervalMs: 15 * 60_000,
+    forwardSystemPrompt: false,
+    digestMaxChars: 8_000,
+    allowAuxiliary: true,
+    compactionMaxChars: 800_000,
+    extraArgs: [],
   }
 }
 
-// Stable LlmError codes surfaced by the adapter (spec error table).
+// Stable LlmError codes surfaced by the adapter
 export const Err = {
   AUTH: 'AUTH',
-  AGY_NOT_INSTALLED: 'AGY_NOT_INSTALLED',
-  AGY_VERSION_UNSUPPORTED: 'AGY_VERSION_UNSUPPORTED',
-  AGY_ERROR: 'AGY_ERROR',
+  AUTH_REQUIRED: 'AUTH_REQUIRED',
+  RATE_LIMIT: 'RATE_LIMIT',
+  CONNECT_ERROR: 'CONNECT_ERROR',
+  STREAM_ERROR: 'STREAM_ERROR',
   TIMEOUT: 'TIMEOUT',
-  PROCESS_EXIT: 'PROCESS_EXIT',
-  INVALID_OUTPUT: 'INVALID_OUTPUT',
-  UNKNOWN_MODEL: 'UNKNOWN_MODEL',
-  UNSUPPORTED_REASONING_EFFORT: 'UNSUPPORTED_REASONING_EFFORT',
-  AUX_DISABLED: 'AUX_DISABLED',
-  BUSY: 'BUSY',
+  UNKNOWN: 'UNKNOWN',
 } as const
 
-// Raw usage object as emitted by agy stream-json (snake_case).
-export interface RawUsage {
-  input_tokens?: number
-  output_tokens?: number
-  thinking_tokens?: number
-  cache_read_tokens?: number
-  cache_write_tokens?: number
-  total_tokens?: number
+export function looksLikeAuthFailure(text?: string): boolean {
+  if (!text) return false
+  return /auth|unauthorized|permission denied|invalid credential|login required|token expired|please sign in/i.test(text)
 }
 
-export type AgyStepKind =
-  | 'text'
-  | 'thinking'
-  | 'tool'
-  | 'title'
-  | 'subagent'
-  | 'user-input'
-  | 'unknown'
-
-export interface AgyToolInfo {
-  name: string
-  /** Raw arguments: JSON string when agy serializes them, else object. */
-  args?: unknown
-  output?: unknown
-  /** Tool-side failure text (agy 1.1.15: tool_info.error.message on state=ERROR). */
-  error?: string
-}
-
-export type AgyEvent =
-  | { kind: 'init'; conversationId?: string; model?: string; raw: unknown }
-  | {
-      kind: 'step'
-      stepKey: string
-      stepKind: AgyStepKind
-      text: string
-      /** text is a sequential fragment to append, not a cumulative snapshot (agy ≥1.1.15 text_delta). */
-      fragment?: boolean
-      tool?: AgyToolInfo
-      /** Step lifecycle as reported by agy: ACTIVE / DONE / ERROR. */
-      state?: string
-      /** Per-step usage (agy ≥1.1.15 reports usage on agent_response steps). */
-      usage?: RawUsage
-      raw: unknown
-    }
-  | {
-      kind: 'result'
-      conversationId: string
-      ok: boolean
-      response: string
-      error?: string
-      usage: RawUsage
-      raw: unknown
-    }
-  | { kind: 'garbage'; line: string }
-
-// Auth-failure sniffing shared by the runner tail, parser output and the
-// result envelope (observed on agy 1.1.13: an authentication-required
-// banner plus result.error text).
-export function looksLikeAuthFailure(text: string): boolean {
-  return /authentication required|authentication failed|please sign in|not signed in|timed out waiting for authentication/i.test(
-    text,
-  )
-}
-
-// Google OAuth consent URL pattern; trailing punctuation is trimmed.
-export function extractAuthUrl(text: string): string | undefined {
-  const m = text.match(/https:\/\/accounts\.google\.com\/\S+/)
-  if (!m) return undefined
-  return m[0].replace(/[)\]>.,;\x27\x22]+$/, '')
-}
-
-/**
- * HARD, server-issued rate-limit signatures — the ONLY patterns allowed to
- * put an account into cooldown. Deliberately narrow: bare `429` or
- * `rate limit` matched incidental substrings in the wild (hash/UUID
- * fragments, model prose mentioning quotas, unrelated tool/permission
- * errors quoting such words) and produced ghost cooldowns that froze
- * healthy accounts out of rotation.
- */
 export function looksLikeHardRateLimit(text?: string): boolean {
   if (!text) return false
   return /RESOURCE_EXHAUSTED|code[ :]?429\b|status[ :]?429\b|HTTP[ :]?429\b|too many requests|individual quota reached|quota (?:exceeded|reached|exhausted)|rate[ -]?limit(?:ed)? (?:exceeded|reached|hit)|exceeded (?:your |the )?quota/i.test(
@@ -212,10 +148,6 @@ export function looksLikeHardRateLimit(text?: string): boolean {
   )
 }
 
-/**
- * Soft heuristic adds capacity signals (model overloaded / high traffic).
- * Shapes the user-facing error message only — NEVER cools an account down.
- */
 export function looksLikeRateLimit(text?: string): boolean {
   if (!text) return false
   return (
@@ -223,11 +155,6 @@ export function looksLikeRateLimit(text?: string): boolean {
   )
 }
 
-/**
- * Parse reset duration in milliseconds from rate-limit / quota-exhausted error strings.
- * Supports compact formats ("Resets in 21m25s", "Resets in 2h26m6s", "Resets in 45s"),
- * verbose formats ("Resets in 15 minutes", "retry after 30 seconds"), and ISO timestamps.
- */
 export function parseResetDurationMs(text?: string): number | undefined {
   if (!text) return undefined
 
@@ -260,6 +187,10 @@ export function parseResetDurationMs(text?: string): number | undefined {
     }
   }
 
+  const retrySec = parseInt(text.trim(), 10)
+  if (!Number.isNaN(retrySec) && retrySec > 0 && retrySec < 86400 * 7) {
+    return retrySec * 1000
+  }
+
   return undefined
 }
-

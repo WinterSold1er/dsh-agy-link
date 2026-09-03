@@ -1,17 +1,26 @@
-// One-shot text runner shared by the agy_ask tool: spawn agy, collect the
-// final response text (streamed text steps, else the result envelope), and
-// surface the conversation id so the caller can continue later.
-import { looksLikeAuthFailure, type PluginConfig } from '../common/types.ts'
-import { StreamJsonParser } from './parser.ts'
-import { startAgyProcess } from './runner.ts'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+// Direct CloudCode oneshot text runner for agy_ask tool.
+import { isAbsolute, resolve } from 'node:path'
+import { readFile } from 'node:fs/promises'
+import type { PluginConfig } from '../common/types.ts'
+import { modelFamilyOf } from '../common/pool-types.ts'
+import type { AccountPoolManager } from './pool.ts'
+import type { QuotaService } from './quota.ts'
+import {
+  getAntigravityRequestModelId,
+  getMaxOutputTokens,
+  getThinkingConfig,
+} from './models.ts'
+import {
+  antigravityRequestEnvelope,
+  ensureProject,
+  streamGenerateContent,
+  type AntigravityGenerateRequest,
+} from './client.ts'
+import { mapSseStreamToChunks } from './sse-mapper.ts'
 
 /** Per-file inline cap; larger files are truncated. */
 const INLINE_MAX_BYTES = 256 * 1024
 
-/** Text-detection: anything that is very likely not binary. */
 function looksTextual(head: string): boolean {
   if (head === '') return true
   let suspicious = 0
@@ -23,11 +32,6 @@ function looksTextual(head: string): boolean {
   return suspicious / n < 0.05
 }
 
-/**
- * Inline text files into the prompt (v0.2): each readable textual file
- * becomes a fenced section. Paths resolve against the oneshot cwd;
- * absolute paths pass through.
- */
 export async function inlineFiles(
   prompt: string,
   paths: readonly string[],
@@ -42,7 +46,7 @@ export async function inlineFiles(
     try {
       const buf = await readFile(p)
       if (!looksTextual(buf.subarray(0, Math.min(buf.length, 4096)).toString('utf8'))) {
-        note = '(skipped: binary file - reference it by path and let agy read it with its own tools)'
+        note = '(skipped: binary file)'
       } else if (buf.byteLength > INLINE_MAX_BYTES) {
         note = '(truncated to the first ' + INLINE_MAX_BYTES + ' bytes)'
         body = buf.subarray(0, INLINE_MAX_BYTES).toString('utf8')
@@ -57,15 +61,6 @@ export async function inlineFiles(
   return prompt + '\n\n' + sections.join('\n\n')
 }
 
-/** Write a JSON schema to a temp file; returns the --json-schema argv tail. */
-export async function schemaArgs(schema: unknown): Promise<{ args: string[]; cleanup: () => Promise<void> }> {
-  const text = JSON.stringify(schema)
-  const dir = await mkdtemp(join(tmpdir(), 'agy-schema-'))
-  const file = join(dir, 'schema.json')
-  await writeFile(file, text, 'utf8')
-  return { args: ['--json-schema', file], cleanup: () => rm(dir, { recursive: true, force: true }) }
-}
-
 export interface OneShotResult {
   ok: boolean
   text: string
@@ -76,7 +71,9 @@ export interface OneShotResult {
 
 export interface OneShotDeps {
   cfg: () => PluginConfig
-  bin: () => string | null
+  pool?: AccountPoolManager
+  quota?: QuotaService
+  endpointCandidates?: string[]
 }
 
 export async function runAgyOnce(
@@ -88,78 +85,138 @@ export async function runAgyOnce(
     mode?: string
     timeoutMs?: number
     signal?: AbortSignal
-    /** Workspace-relative or absolute text files to inline into the prompt. */
     readPaths?: readonly string[]
-    /** JSON schema enforcing the final result (--json-schema). */
     schema?: unknown
   },
 ): Promise<OneShotResult> {
+  const startTime = Date.now()
   const cfg = deps.cfg()
-  const bin = deps.bin()
-  if (!bin) return { ok: false, text: '', conversationId: null, error: 'agy binary not found', durationMs: 0 }
   const timeoutMs = req.timeoutMs ?? cfg.timeoutMs
-  const args: string[] = [
-    '--output-format', 'stream-json',
-    '--print-timeout', Math.max(1, Math.ceil(timeoutMs / 60_000)) + 'm',
-  ]
-  const mode = req.mode ?? cfg.permissionMode
-  if (mode === 'skip') args.push('--dangerously-skip-permissions')
-  else args.push('--mode', mode)
-  if (req.model) args.push('--model', req.model)
-  if (req.effort) args.push('--effort', req.effort)
-  let prompt = req.prompt
-  if (req.readPaths && req.readPaths.length > 0) {
-    prompt = await inlineFiles(prompt, req.readPaths, cfg.workspaceRoot !== '' ? cfg.workspaceRoot : process.cwd())
+  const abortController = new AbortController()
+  const timeoutTimer = setTimeout(() => abortController.abort(), timeoutMs)
+
+  if (req.signal) {
+    req.signal.addEventListener('abort', () => abortController.abort())
   }
-  let cleanup: (() => Promise<void>) | null = null
-  if (req.schema !== undefined && req.schema !== null) {
-    const sa = await schemaArgs(req.schema)
-    args.push(...sa.args)
-    cleanup = sa.cleanup
-  }
-  args.push('-p', prompt)
-  const parser = new StreamJsonParser()
-  const textParts: string[] = []
-  let resultText = ''
-  let conversationId: string | null = null
-  const proc = startAgyProcess({
-    bin,
-    args,
-    cwd: cfg.workspaceRoot !== '' ? cfg.workspaceRoot : undefined,
-    timeoutMs,
-    signal: req.signal,
-    onLine: (line) => {
-      for (const ev of parser.feed(line + '\n')) {
-        if (ev.kind === 'init' && ev.conversationId) conversationId = ev.conversationId
-        if (ev.kind === 'step' && ev.stepKind === 'text' && ev.text !== '') textParts.push(ev.text)
-        if (ev.kind === 'result') {
-          if (ev.conversationId !== '') conversationId = ev.conversationId
-          resultText = ev.response
+
+  try {
+    const requestedModel = req.model || cfg.defaultModel || 'gemini-3.7-flash'
+    const wireModel = getAntigravityRequestModelId(requestedModel, req.effort)
+    const isClaude = requestedModel.startsWith('claude-')
+    const maxTokens = getMaxOutputTokens(requestedModel, wireModel)
+    const thinkingConfig = getThinkingConfig(requestedModel, req.effort)
+
+    let prompt = req.prompt
+    if (req.readPaths && req.readPaths.length > 0) {
+      prompt = await inlineFiles(prompt, req.readPaths, process.cwd())
+    }
+
+    const family = modelFamilyOf(requestedModel)
+    const account = deps.pool?.selectAccount(family)
+    const accountId = account?.id || 'acc_default'
+
+    let token: string | null = null
+    if (process.env.ANTIGRAVITY_TOKEN?.trim()) {
+      token = process.env.ANTIGRAVITY_TOKEN.trim()
+    } else if (deps.quota && account) {
+      token = await deps.quota.getValidAccessToken(account)
+    } else if (deps.pool) {
+      token = deps.pool.getMemoryToken(accountId)
+    }
+
+    if (!token) {
+      return {
+        ok: false,
+        text: '',
+        conversationId: null,
+        error: 'No authenticated Antigravity account available.',
+        durationMs: Date.now() - startTime,
+      }
+    }
+
+    const proxyUrl = account?.proxyUrl
+    const endpoints = deps.endpointCandidates || cfg.endpointCandidates as string[]
+    const envelope = antigravityRequestEnvelope(wireModel, isClaude)
+    const projectId = await ensureProject(
+      token,
+      account?.alias || account?.id || 'antigravity-default',
+      proxyUrl,
+      endpoints,
+    )
+
+    const requestBody: AntigravityGenerateRequest = {
+      project: projectId,
+      model: wireModel,
+      request: {
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: prompt }],
+          },
+        ],
+        generationConfig: {
+          ...(maxTokens ? { maxOutputTokens: maxTokens } : {}),
+          ...(thinkingConfig ? { thinkingConfig } : {}),
+        },
+        sessionId: envelope.sessionId,
+        labels: envelope.labels,
+      },
+      requestType: 'AGENT',
+      userAgent: 'ANTIGRAVITY',
+      requestId: envelope.requestId,
+    }
+
+    const streamResult = await streamGenerateContent(
+      token,
+      requestBody,
+      abortController.signal,
+      proxyUrl,
+      endpoints,
+    )
+
+    if (!streamResult.response.ok) {
+      const errText = await streamResult.response.text().catch(() => '')
+      return {
+        ok: false,
+        text: '',
+        conversationId: null,
+        error: `CloudCode API error HTTP ${streamResult.response.status}: ${errText}`,
+        durationMs: Date.now() - startTime,
+      }
+    }
+
+    let fullText = ''
+    for await (const chunk of mapSseStreamToChunks(streamResult.response, abortController.signal)) {
+      if (chunk.type === 'text-delta') {
+        fullText += chunk.text
+      } else if (chunk.type === 'block-end' && chunk.block.type === 'text') {
+        // block end
+      } else if (chunk.type === 'finish' && chunk.reason.kind === 'error') {
+        return {
+          ok: false,
+          text: fullText,
+          conversationId: null,
+          error: chunk.reason.failure?.message || 'Stream error',
+          durationMs: Date.now() - startTime,
         }
       }
-    },
-  })
-  const outcome = await proc.outcome
-  if (cleanup) void cleanup().catch(() => {})
-  for (const ev of parser.flush()) {
-    if (ev.kind === 'result') {
-      if (ev.conversationId !== '') conversationId = ev.conversationId
-      resultText = ev.response
     }
+
+    return {
+      ok: true,
+      text: fullText,
+      conversationId: null,
+      durationMs: Date.now() - startTime,
+    }
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      text: '',
+      conversationId: null,
+      error: err instanceof Error ? err.message : String(err),
+      durationMs: Date.now() - startTime,
+    }
+  } finally {
+    clearTimeout(timeoutTimer)
   }
-  if (outcome.aborted) {
-    return { ok: false, text: '', conversationId, error: 'aborted', durationMs: outcome.durationMs }
-  }
-  if (outcome.timedOut) {
-    return { ok: false, text: '', conversationId, error: 'timed out after ' + timeoutMs + 'ms', durationMs: outcome.durationMs }
-  }
-  if (looksLikeAuthFailure(outcome.stderrTail) || looksLikeAuthFailure(outcome.stdout.slice(0, 4000))) {
-    return { ok: false, text: '', conversationId, error: 'agy is not signed in — run /agy auth', durationMs: outcome.durationMs }
-  }
-  const joined = textParts.join('\n').trim()
-  const text = joined !== '' ? joined : resultText
-  if (outcome.code !== 0 && text === '') {
-    return { ok: false, text: '', conversationId, error: 'agy exited with code ' + outcome.code + ': ' + outcome.stderrTail.slice(-300), durationMs: outcome.durationMs }
-  }
-  return { ok: text !== '', text: text === '' ? '(no output)' : text, conversationId, durationMs: outcome.durationMs }
 }

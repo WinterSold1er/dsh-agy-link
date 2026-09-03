@@ -15,8 +15,10 @@ export interface SessionBinding {
 
 export class SessionStore {
   private data: Record<string, SessionBinding> = {};
+  private readonly file: string;
 
-  constructor(private readonly file: string) {
+  constructor(file: string) {
+    this.file = file;
     this.load();
   }
 

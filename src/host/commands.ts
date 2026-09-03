@@ -1,6 +1,4 @@
-// /agy command family (spec section 6). One registered command dispatches
-// on its first token; every handler answers with GUI-renderable markdown.
-import { isAbsolute } from 'node:path'
+// /agy command family: status, accounts, quota, login, models, diagnostics
 import type { CommandDefinition, CommandResult } from '@deepseek-ai/dsh-commands'
 import type { PluginConfig } from '../common/types.ts'
 import type { AuthHelper } from './auth.ts'
@@ -12,11 +10,9 @@ import type { QuotaService } from './quota.ts'
 
 export interface CommandDeps {
   cfg: () => PluginConfig
-  bin: () => string | null
-  version: () => string | null
   auth: () => AuthHelper | null
   catalog: () => ModelCatalog
-  store: () => SessionStore
+  store?: () => SessionStore
   pool?: () => AccountPoolManager
   poolAuth?: () => PoolAuthFlow
   quota?: () => QuotaService
@@ -26,8 +22,8 @@ export interface CommandDeps {
 }
 
 const HELP = [
-  '**/agy** — Antigravity (agy CLI) bridge',
-  '- `/agy status` — binary, version, auth, mode, catalog, bindings',
+  '**/agy** — Antigravity (Google CloudCode direct) bridge',
+  '- `/agy status` — direct connection, auth, catalog, accounts',
   '- `/agy pool` / `/agy accounts` — account pool, live quota %, cooldowns',
   '- `/agy add-account [alias]` — start OAuth login for a new account slot',
   '- `/agy refresh-quota` — query Google backend for fresh quota %',
@@ -36,10 +32,7 @@ const HELP = [
   '- `/agy auth` — Google login for the primary account (opens the browser)',
   '- `/agy auth-code <code>` — finish login by pasting the code (fallback)',
   '- `/agy models` — refresh and list discovered models',
-  '- `/agy mode <skip|plan|accept-edits>` — permission mode (next turn)',
   '- `/agy effort <low|medium|high|default>` — default reasoning effort',
-  '- `/agy workspace [path]` — set the agy working directory (absolute path; omit to show)',
-  '- `/agy clear` — drop the most recent conversation binding',
   '- `/agy doctor` — write a diagnostic report and return its path',
   '- `/agy help` — this text',
 ].join('\n')
@@ -47,7 +40,7 @@ const HELP = [
 export function agyCommandDefinition(deps: CommandDeps): CommandDefinition {
   return {
     name: 'agy',
-    description: 'Antigravity (agy CLI) bridge: status, login, models, mode, diagnostics',
+    description: 'Antigravity bridge: status, login, models, diagnostics',
     handler: (invocation) => handle(deps, invocation.rawInput),
   }
 }
@@ -90,15 +83,22 @@ async function handle(deps: CommandDeps, raw: string): Promise<CommandResult> {
       return ok(lines.join('\n'))
     }
     if (sub === 'add-account') {
-      const pool = deps.pool?.()
-      if (!pool) return err('Account pool not available')
-      const acc = pool.createAccountSlot(arg || undefined)
-      return ok([
-        `**Account slot created: [${acc.alias}]** (id: \`${acc.id}\`)`,
-        `- Isolated directory: \`${acc.dir}\``,
-        `- Run in terminal: \`HOME="${acc.dir}" agy\` to authenticate this Google account.`,
-        `- Once logged in, run: \`/agy pool\` or click 🔄 刷新额度 in WebUI.`,
-      ].join('\n'))
+      const flow = deps.poolAuth?.()
+      if (!flow) return err('Auth flow not available')
+      const st = await flow.begin(arg || undefined)
+      if (st.ok && st.url) {
+        return ok([
+          `**Account slot created: [${st.alias}]** (id: \`${st.stagingId}\`)`,
+          st.browserOpened
+            ? '**浏览器已打开 Google 授权页** — 批准访问后自动完成登录。'
+            : '**请手动打开下面的 URL 完成 Google 授权：**',
+          '',
+          st.url,
+          '',
+          `备用：授权完成后运行 \`/agy auth-code <授权码或完整回调URL>\`。`,
+        ].join('\n'))
+      }
+      return err(st.message ?? 'failed to create account slot')
     }
     if (sub === 'refresh-quota') {
       const quota = deps.quota?.()
@@ -143,7 +143,7 @@ async function handle(deps: CommandDeps, raw: string): Promise<CommandResult> {
       if (!flow) return err('auth flow not available')
       const st = await flow.submitCode(arg)
       if (st.ok) {
-        deps.store().clear()
+        deps.store?.()?.clear()
         return ok(st.message ?? 'Logged in to Antigravity.')
       }
       return err(st.message ?? 'login failed')
@@ -158,39 +158,12 @@ async function handle(deps: CommandDeps, raw: string): Promise<CommandResult> {
       }
       return ok(lines.join('\n'))
     }
-    if (sub === 'mode') {
-      if (!['skip', 'plan', 'accept-edits'].includes(arg)) {
-        return err('usage: /agy mode <skip|plan|accept-edits>')
-      }
-      deps.setOverride('permissionMode', arg)
-      return ok('Permission mode set to **' + arg + '** — effective next turn.')
-    }
     if (sub === 'effort') {
       if (!['low', 'medium', 'high', 'default'].includes(arg)) {
         return err('usage: /agy effort <low|medium|high|default>')
       }
       deps.setOverride('defaultEffort', arg === 'default' ? '' : arg)
       return ok('Default effort set to **' + (arg === 'default' ? 'model default' : arg) + '**.')
-    }
-    if (sub === 'workspace') {
-      if (arg === '') return ok('Current workspace: ' + (deps.cfg().workspaceRoot !== '' ? deps.cfg().workspaceRoot : '(session cwd / process cwd)'))
-      if (arg === 'default' || arg === 'clear') {
-        deps.setOverride('workspaceRoot', '')
-        return ok('Workspace reset to session cwd / process cwd.')
-      }
-      if (!isAbsolute(arg)) return err('workspace must be an absolute path (or `default` to clear)')
-      deps.setOverride('workspaceRoot', arg)
-      return ok('Workspace set to **' + arg + '** — effective next turn.')
-    }
-    if (sub === 'clear') {
-      const all = deps.store().all()
-      const keys = Object.keys(all)
-      if (keys.length === 0) return ok('No conversation bindings yet.')
-      const key = keys.reduce((a, b) => ((all[a]?.updatedAt ?? 0) >= (all[b]?.updatedAt ?? 0) ? a : b))
-      const dropped = all[key]
-      if (dropped === undefined) return ok('No conversation bindings yet.')
-      deps.store().delete(key)
-      return ok('Dropped binding for session `' + key + '` — agy conversation ' + dropped.conversationId + '. The next turn starts a fresh agy conversation.')
     }
     if (sub === 'doctor') {
       const path = await deps.runDoctor()
@@ -204,24 +177,21 @@ async function handle(deps: CommandDeps, raw: string): Promise<CommandResult> {
 
 async function renderStatus(deps: CommandDeps): Promise<string> {
   const cfg = deps.cfg()
-  const bin = deps.bin()
   const authHelper = deps.auth()
   const auth = authHelper ? await authHelper.resolvedStatus() : undefined
   const cat = deps.catalog().get()
-  const bindings = Object.keys(deps.store().all()).length
+  const pool = deps.pool?.()
+  const accounts = pool ? pool.getAccounts() : []
   const last = deps.lastRun()
   const lines = [
-    '**dsh-agy-link status**',
-    '- agy binary: ' + (bin ?? 'not found — install via https://antigravity.google/docs/cli/install'),
-    '- version: ' + (deps.version() ?? 'unknown'),
+    '**dsh-agy-link status (Direct CloudCode)**',
+    '- transport: direct Google CloudCode API',
     '- auth: ' + (auth ? auth.phase + (auth.message ? ' — ' + auth.message : '') : 'unknown'),
-    '- permission mode: ' + cfg.permissionMode + (cfg.permissionMode === 'skip' ? ' — WARNING: agy runs tools without approval' : ''),
-    '- workspace: ' + (cfg.workspaceRoot !== '' ? cfg.workspaceRoot : '(session cwd / process cwd)'),
-    '- default model: ' + (cfg.defaultModel === '' ? '(agy default)' : cfg.defaultModel),
-    '- default effort: ' + (cfg.defaultEffort === '' ? '(model default)' : cfg.defaultEffort),
-    '- catalog: ' + cat.models.length + ' models — ' + cat.source + (cat.lastError === undefined ? '' : ' — last error: ' + cat.lastError),
-    '- conversation bindings: ' + bindings,
-    '- last run: ' + (last ? (last.ok ? 'ok' : last.code) + ' — ' + last.model + ' in ' + Math.round(last.durationMs / 100) / 10 + 's' : 'none yet'),
+    '- default model: ' + (cfg.defaultModel !== '' ? cfg.defaultModel : '(none - use /model picker)'),
+    '- default effort: ' + (cfg.defaultEffort !== '' ? cfg.defaultEffort : 'model default'),
+    '- catalog: ' + cat.source + ' (' + cat.models.length + ' models)',
+    '- pool accounts: ' + accounts.length + ' accounts configured',
+    '- last call: ' + (last ? (last.ok ? 'OK' : 'FAIL: ' + last.code) + ' (' + last.durationMs + 'ms, ' + last.model + ')' : '(none yet)'),
   ]
   return lines.join('\n')
 }

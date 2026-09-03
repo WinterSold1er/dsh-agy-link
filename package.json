@@ -83,7 +83,7 @@
   "scripts": {
     "build": "tsdown",
     "check": "tsc --noEmit",
-    "test": "node --experimental-transform-types --test \"test/**/*.test.ts\"",
+    "test": "node --test \"test/**/*.test.ts\"",
     "prepack": "npm run build"
   },
   "engines": {

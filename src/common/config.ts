@@ -1,6 +1,6 @@
 // Config resolution: env (DSH_AGY_*) > runtime overrides file > cordis
-// entry config > defaults (spec ADR-13). The overrides file backs /agy
-// hot changes and survives restarts; the env is read per call so a changed
+// entry config > defaults. The overrides file backs /agy hot changes
+// and survives restarts; the env is read per call so a changed
 // process environment is honored without reload.
 import { defaultConfig, type PermissionMode, type PluginConfig } from './types.ts'
 import { readFileSync, existsSync } from 'node:fs'
@@ -75,23 +75,18 @@ export function resolveConfig(
   const cfg: PluginConfig = {
     ...base,
     enabled: asBool(get('enabled')) ?? base.enabled,
-    agyBin: asString(get('agyBin')) ?? base.agyBin,
-    extraArgs: Array.isArray(get('extraArgs'))
-      ? (get('extraArgs') as unknown[]).filter((x): x is string => typeof x === 'string')
-      : base.extraArgs,
-    permissionMode: asMode(get('permissionMode')) ?? base.permissionMode,
     defaultModel: asString(get('defaultModel')) ?? base.defaultModel,
     defaultEffort: asString(get('defaultEffort')) ?? base.defaultEffort,
     timeoutMs: asNum(get('timeoutMs')) ?? base.timeoutMs,
     maxConcurrent: asNum(get('maxConcurrent')) ?? base.maxConcurrent,
     contextWindowDefault: asNum(get('contextWindowDefault')) ?? base.contextWindowDefault,
     maxTokensDefault: asNum(get('maxTokensDefault')) ?? base.maxTokensDefault,
-    forwardSystemPrompt: asBool(get('forwardSystemPrompt')) ?? base.forwardSystemPrompt,
-    digestMaxChars: asNum(get('digestMaxChars')) ?? base.digestMaxChars,
+    quotaPollIntervalMs: asNum(get('quotaPollIntervalMs')) ?? base.quotaPollIntervalMs,
     modelsCacheTtlMs: asNum(get('modelsCacheTtlMs')) ?? base.modelsCacheTtlMs,
-    allowAuxiliary: asBool(get('allowAuxiliary')) ?? base.allowAuxiliary,
-    compactionMaxChars: asNum(get('compactionMaxChars')) ?? base.compactionMaxChars,
-    workspaceRoot: asString(get('workspaceRoot')) ?? base.workspaceRoot,
+    baseUrl: asString(get('baseUrl')) ?? base.baseUrl,
+    endpointCandidates: Array.isArray(get('endpointCandidates'))
+      ? (get('endpointCandidates') as unknown[]).filter((x): x is string => typeof x === 'string')
+      : base.endpointCandidates,
     fallbackModels: Array.isArray(get('fallbackModels'))
       ? (get('fallbackModels') as unknown[]).filter(
           (x): x is PluginConfig['fallbackModels'][number] =>
@@ -99,68 +94,47 @@ export function resolveConfig(
         )
       : base.fallbackModels,
     askTool: asBool(get('askTool')) ?? base.askTool,
-    mediaDir: asString(get('mediaDir')) ?? base.mediaDir,
-    mediaTtlMs: asNum(get('mediaTtlMs')) ?? base.mediaTtlMs,
-    mediaMaxBytes: asNum(get('mediaMaxBytes')) ?? base.mediaMaxBytes,
-    mediaMaxImages: asNum(get('mediaMaxImages')) ?? base.mediaMaxImages,
-    mcpBridge: asBool(get('mcpBridge')) ?? base.mcpBridge,
-    mcpToolAllowlist: asString(get('mcpToolAllowlist')) ?? base.mcpToolAllowlist,
     rateLimitPerMinute: asNum(get('rateLimitPerMinute')) ?? base.rateLimitPerMinute,
     autoFallbackModel: asBool(get('autoFallbackModel')) ?? base.autoFallbackModel,
     logRetentionDays: asNum(get('logRetentionDays')) ?? base.logRetentionDays,
     disableTelemetry: asBool(get('disableTelemetry')) ?? base.disableTelemetry,
-    quotaPollIntervalMs: asNum(get('quotaPollIntervalMs')) ?? base.quotaPollIntervalMs,
+
+    // Deprecated fields kept for backward compatibility
+    agyBin: asString(get('agyBin')) ?? base.agyBin,
+    permissionMode: asMode(get('permissionMode')) ?? base.permissionMode,
+    workspaceRoot: asString(get('workspaceRoot')) ?? base.workspaceRoot,
+    mcpBridge: asBool(get('mcpBridge')) ?? base.mcpBridge,
+    mcpToolAllowlist: asString(get('mcpToolAllowlist')) ?? base.mcpToolAllowlist,
+    mediaDir: asString(get('mediaDir')) ?? base.mediaDir,
+    mediaTtlMs: asNum(get('mediaTtlMs')) ?? base.mediaTtlMs,
+    mediaMaxBytes: asNum(get('mediaMaxBytes')) ?? base.mediaMaxBytes,
+    mediaMaxImages: asNum(get('mediaMaxImages')) ?? base.mediaMaxImages,
+    forwardSystemPrompt: asBool(get('forwardSystemPrompt')) ?? base.forwardSystemPrompt,
+    digestMaxChars: asNum(get('digestMaxChars')) ?? base.digestMaxChars,
+    allowAuxiliary: asBool(get('allowAuxiliary')) ?? base.allowAuxiliary,
+    compactionMaxChars: asNum(get('compactionMaxChars')) ?? base.compactionMaxChars,
+    extraArgs: Array.isArray(get('extraArgs'))
+      ? (get('extraArgs') as unknown[]).filter((x): x is string => typeof x === 'string')
+      : base.extraArgs,
   }
-  // Env wins last (spec ADR-13).
+
+  // Env wins last
   if (env.DSH_AGY_ENABLED !== undefined) cfg.enabled = asBool(env.DSH_AGY_ENABLED) ?? cfg.enabled
-  if (env.DSH_AGY_BIN) cfg.agyBin = env.DSH_AGY_BIN
-  if (env.DSH_AGY_MODE) {
-    const m = asMode(env.DSH_AGY_MODE)
-    if (m) cfg.permissionMode = m
-  }
-  if (env.DSH_AGY_SKIP_PERMISSIONS !== undefined) {
-    const skip = asBool(env.DSH_AGY_SKIP_PERMISSIONS)
-    if (skip !== undefined) cfg.permissionMode = skip ? 'skip' : 'plan'
-  }
+  if (env.ANTIGRAVITY_BASE_URL) cfg.baseUrl = env.ANTIGRAVITY_BASE_URL
   if (env.DSH_AGY_DEFAULT_MODEL) cfg.defaultModel = env.DSH_AGY_DEFAULT_MODEL
   if (env.DSH_AGY_DEFAULT_EFFORT) cfg.defaultEffort = env.DSH_AGY_DEFAULT_EFFORT
   if (env.DSH_AGY_TIMEOUT_MS) {
-    const t = asNum(env.DSH_AGY_TIMEOUT_MS)
-    if (t && t > 0) cfg.timeoutMs = t
+    const n = asNum(env.DSH_AGY_TIMEOUT_MS)
+    if (n) cfg.timeoutMs = n
   }
-  if (env.DSH_AGY_EXTRA_ARGS) {
-    cfg.extraArgs = env.DSH_AGY_EXTRA_ARGS.split(/\s+/).filter(Boolean)
-  }
-  if (env.DSH_AGY_WORKSPACE_ROOT) cfg.workspaceRoot = env.DSH_AGY_WORKSPACE_ROOT
-  if (env.DSH_AGY_MEDIA_DIR) cfg.mediaDir = env.DSH_AGY_MEDIA_DIR
-  if (env.DSH_AGY_MEDIA_TTL_MS) {
-    const t = asNum(env.DSH_AGY_MEDIA_TTL_MS)
-    if (t && t > 0) cfg.mediaTtlMs = t
-  }
-  if (env.DSH_AGY_MCP_BRIDGE !== undefined) {
-    const b = asBool(env.DSH_AGY_MCP_BRIDGE)
-    if (b !== undefined) cfg.mcpBridge = b
-  }
-  if (env.DSH_AGY_MCP_TOOL_ALLOWLIST) cfg.mcpToolAllowlist = env.DSH_AGY_MCP_TOOL_ALLOWLIST
-  if (env.DSH_AGY_RATE_LIMIT_PER_MINUTE) {
-    const r = asNum(env.DSH_AGY_RATE_LIMIT_PER_MINUTE)
-    if (r !== undefined && r >= 0) cfg.rateLimitPerMinute = r
-  }
-  if (env.DSH_AGY_AUTO_FALLBACK_MODEL !== undefined) {
-    const af = asBool(env.DSH_AGY_AUTO_FALLBACK_MODEL)
-    if (af !== undefined) cfg.autoFallbackModel = af
-  }
-  if (env.DSH_AGY_LOG_RETENTION_DAYS) {
-    const l = asNum(env.DSH_AGY_LOG_RETENTION_DAYS)
-    if (l && l > 0) cfg.logRetentionDays = l
-  }
-  if (env.DSH_AGY_DISABLE_TELEMETRY !== undefined) {
-    const dt = asBool(env.DSH_AGY_DISABLE_TELEMETRY)
-    if (dt !== undefined) cfg.disableTelemetry = dt
+  if (env.DSH_AGY_MAX_CONCURRENT) {
+    const n = asNum(env.DSH_AGY_MAX_CONCURRENT)
+    if (n) cfg.maxConcurrent = n
   }
   if (env.DSH_AGY_QUOTA_POLL_INTERVAL_MS) {
-    const q = asNum(env.DSH_AGY_QUOTA_POLL_INTERVAL_MS)
-    if (q && q >= 60_000) cfg.quotaPollIntervalMs = q
+    const n = asNum(env.DSH_AGY_QUOTA_POLL_INTERVAL_MS)
+    if (n) cfg.quotaPollIntervalMs = Math.max(60_000, n)
   }
+
   return cfg
 }

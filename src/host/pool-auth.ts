@@ -65,12 +65,19 @@ export class PoolAuthFlow {
   private doneResetTimer: NodeJS.Timeout | null = null
   private readonly open: (url: string) => Promise<boolean>
 
+  private readonly pool: AccountPoolManager
+  private readonly quota: QuotaService
+  private readonly log: (msg: string) => void
+
   constructor(
-    private readonly pool: AccountPoolManager,
-    private readonly quota: QuotaService,
-    private readonly log: (msg: string) => void = () => {},
+    pool: AccountPoolManager,
+    quota: QuotaService,
+    log: (msg: string) => void = () => {},
     deps: PoolAuthFlowDeps = {},
   ) {
+    this.pool = pool
+    this.quota = quota
+    this.log = log
     this.open = deps.openBrowser ?? openBrowser
   }
 
