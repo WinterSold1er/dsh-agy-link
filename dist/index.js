@@ -126,6 +126,18 @@ function parseResetDurationMs(text) {
 	const retrySec = parseInt(text.trim(), 10);
 	if (!Number.isNaN(retrySec) && retrySec > 0 && retrySec < 604800) return retrySec * 1e3;
 }
+function formatDuration(ms) {
+	if (ms <= 0) return "0s";
+	const totalSecs = Math.ceil(ms / 1e3);
+	const days = Math.floor(totalSecs / 86400);
+	const hours = Math.floor(totalSecs % 86400 / 3600);
+	const mins = Math.floor(totalSecs % 3600 / 60);
+	const secs = totalSecs % 60;
+	if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+	if (hours > 0) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+	if (mins > 0) return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
+	return `${secs}s`;
+}
 //#endregion
 //#region src/common/config.ts
 function dshHome() {
@@ -25024,10 +25036,46 @@ var AgyAdapter = class extends LlmAdapter {
 				let account = null;
 				if (this.deps.pool) {
 					account = this.deps.pool.selectAccount(family);
-					if (account && triedAccountIds.has(account.id)) {
-						const alt = this.deps.pool.getAccounts().find((a) => a.enabled && !a.authRequired && !triedAccountIds.has(a.id));
-						if (alt) account = alt;
+					if (account && triedAccountIds.has(account.id)) account = this.deps.pool.getAccounts().find((a) => {
+						if (!a.enabled || a.authRequired || triedAccountIds.has(a.id)) return false;
+						const cd = a.cooldowns[family];
+						if (cd && cd.cooldownUntil > Date.now()) return false;
+						const q = a.quotas[family];
+						if (q && typeof q.remainingFraction === "number" && q.remainingFraction <= .02) {
+							if (q.resetTime && Date.parse(q.resetTime) > Date.now()) return false;
+						}
+						if (q && typeof q.weeklyFraction === "number" && q.weeklyFraction <= .01) {
+							if (q.weeklyResetTime && Date.parse(q.weeklyResetTime) > Date.now()) return false;
+						}
+						return true;
+					}) ?? null;
+				}
+				if (!account && this.deps.pool && !process.env.ANTIGRAVITY_TOKEN?.trim()) {
+					const status = this.deps.pool.getFamilyStatus(family);
+					if (status.suppressed) {
+						yield {
+							type: "finish",
+							reason: {
+								kind: "error",
+								failure: {
+									message: `Antigravity quota exhausted for model family '${family}'.${status.resetInMs && status.resetInMs > 0 ? ` Resets in ${formatDuration(status.resetInMs)}.` : ""}`,
+									code: "RATE_LIMIT"
+								}
+							}
+						};
+						return;
 					}
+					yield {
+						type: "finish",
+						reason: {
+							kind: "error",
+							failure: {
+								message: "No authenticated Antigravity account available. Please sign in via /agy auth.",
+								code: "AUTH_REQUIRED"
+							}
+						}
+					};
+					return;
 				}
 				const accountId = account ? account.id : "acc_default";
 				triedAccountIds.add(accountId);
@@ -25155,16 +25203,34 @@ var AgyAdapter = class extends LlmAdapter {
 					if (releaseAccount) releaseAccount();
 				}
 			}
-			if (!hasEmitted) yield {
-				type: "finish",
-				reason: {
-					kind: "error",
-					failure: {
-						message: "All available Antigravity accounts are exhausted or in cooldown.",
-						code: "ACCOUNTS_EXHAUSTED"
+			if (!hasEmitted) {
+				if (this.deps.pool) {
+					const status = this.deps.pool.getFamilyStatus(family);
+					if (status.suppressed) {
+						yield {
+							type: "finish",
+							reason: {
+								kind: "error",
+								failure: {
+									message: `Antigravity quota exhausted for model family '${family}'.${status.resetInMs && status.resetInMs > 0 ? ` Resets in ${formatDuration(status.resetInMs)}.` : ""}`,
+									code: "RATE_LIMIT"
+								}
+							}
+						};
+						return;
 					}
 				}
-			};
+				yield {
+					type: "finish",
+					reason: {
+						kind: "error",
+						failure: {
+							message: "All available Antigravity accounts are exhausted or in cooldown.",
+							code: "ACCOUNTS_EXHAUSTED"
+						}
+					}
+				};
+			}
 		} finally {
 			if (releaseGlobal) releaseGlobal();
 		}
@@ -26129,19 +26195,72 @@ var AccountPoolManager = class {
 		return nextAccount;
 	}
 	/**
-	* Get countdown in milliseconds until the earliest account in cooldown resets.
+	* Get countdown in milliseconds until the earliest account in cooldown or quota resets.
 	*/
 	getEarliestResetCountdown(family) {
 		const now = Date.now();
 		let earliest = null;
 		for (const acc of this.data.accounts) {
-			if (!acc.enabled) continue;
+			if (!acc.enabled || acc.authRequired) continue;
+			let accReset = null;
 			const cd = acc.cooldowns[family];
-			if (cd && cd.cooldownUntil > now) {
-				if (earliest === null || cd.cooldownUntil < earliest) earliest = cd.cooldownUntil;
+			if (cd && cd.cooldownUntil > now) accReset = Math.max(accReset ?? 0, cd.cooldownUntil);
+			const quota = acc.quotas[family];
+			if (quota && typeof quota.remainingFraction === "number" && quota.remainingFraction <= .02) {
+				if (quota.resetTime) {
+					const resetMs = Date.parse(quota.resetTime);
+					if (!Number.isNaN(resetMs) && resetMs > now) accReset = Math.max(accReset ?? 0, resetMs);
+				}
+			}
+			if (quota && typeof quota.weeklyFraction === "number" && quota.weeklyFraction <= .01) {
+				if (quota.weeklyResetTime) {
+					const resetMs = Date.parse(quota.weeklyResetTime);
+					if (!Number.isNaN(resetMs) && resetMs > now) accReset = Math.max(accReset ?? 0, resetMs);
+				}
+			}
+			if (accReset !== null) {
+				if (earliest === null || accReset < earliest) earliest = accReset;
 			}
 		}
 		return earliest !== null ? Math.max(0, earliest - now) : null;
+	}
+	/**
+	* Inspect availability and suppression status for a given model family across the pool.
+	*/
+	getFamilyStatus(family) {
+		const accounts = this.data.accounts;
+		if (accounts.length === 0) return {
+			hasAccount: false,
+			suppressed: false,
+			reason: "no_accounts",
+			resetInMs: null
+		};
+		const enabledAccounts = accounts.filter((a) => a.enabled);
+		if (enabledAccounts.length === 0) return {
+			hasAccount: false,
+			suppressed: false,
+			reason: "disabled",
+			resetInMs: null
+		};
+		const authValidAccounts = enabledAccounts.filter((a) => !a.authRequired);
+		if (authValidAccounts.length === 0) return {
+			hasAccount: false,
+			suppressed: false,
+			reason: "auth_required",
+			resetInMs: null
+		};
+		if (this.selectAccount(family)) return {
+			hasAccount: true,
+			suppressed: false,
+			resetInMs: null
+		};
+		const resetInMs = this.getEarliestResetCountdown(family);
+		return {
+			hasAccount: true,
+			suppressed: true,
+			reason: authValidAccounts.some((a) => a.cooldowns[family] && a.cooldowns[family].cooldownUntil > Date.now()) ? "rate_limited" : "quota_exhausted",
+			resetInMs
+		};
 	}
 };
 //#endregion

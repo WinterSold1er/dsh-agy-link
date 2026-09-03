@@ -130,6 +130,7 @@ export const Err = {
   AUTH: 'AUTH',
   AUTH_REQUIRED: 'AUTH_REQUIRED',
   RATE_LIMIT: 'RATE_LIMIT',
+  QUOTA_EXHAUSTED: 'QUOTA_EXHAUSTED',
   CONNECT_ERROR: 'CONNECT_ERROR',
   STREAM_ERROR: 'STREAM_ERROR',
   TIMEOUT: 'TIMEOUT',
@@ -193,4 +194,18 @@ export function parseResetDurationMs(text?: string): number | undefined {
   }
 
   return undefined
+}
+
+export function formatDuration(ms: number): string {
+  if (ms <= 0) return '0s'
+  const totalSecs = Math.ceil(ms / 1000)
+  const days = Math.floor(totalSecs / 86400)
+  const hours = Math.floor((totalSecs % 86400) / 3600)
+  const mins = Math.floor((totalSecs % 3600) / 60)
+  const secs = totalSecs % 60
+
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`
+  if (hours > 0) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`
+  if (mins > 0) return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`
+  return `${secs}s`
 }

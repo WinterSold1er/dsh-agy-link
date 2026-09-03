@@ -243,4 +243,97 @@ describe('M3: Adapter & Failover', () => {
     assert.equal(preparedGpt.model.name, 'GPT-OSS 120B')
     assert.equal(preparedGpt.model.context?.contextWindow, 200_000)
   })
+
+  it('stream yields RATE_LIMIT when requested model family quota is exhausted (not AUTH_REQUIRED)', async () => {
+    const pool = new AccountPoolManager('/tmp/dsh-test-pool-quota-' + Date.now())
+    const acc = pool.getAccounts()[0]!
+    pool.setMemoryToken(acc.id, 'mock-token', Date.now() + 60_000)
+
+    // Set anthropic quota exhausted with reset in 2 hours
+    const resetTime = new Date(Date.now() + 7200_000).toISOString()
+    pool.updateAccountQuotas(acc.id, {
+      anthropic: {
+        remainingFraction: 0.0,
+        resetTime,
+      },
+      google: {
+        remainingFraction: 0.9,
+      },
+    })
+
+    const catalog = new ModelCatalog(
+      undefined,
+      [
+        { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 Thinking' },
+        { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash' },
+      ],
+      60_000,
+    )
+
+    const adapter = new AgyAdapter({
+      getConfig: () => defaultConfig(),
+      catalog,
+      pool,
+    })
+
+    // 1. Requesting Claude should yield RATE_LIMIT with reset countdown, NOT AUTH_REQUIRED
+    const claudeChunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'antigravity',
+      model: 'claude-opus-4-6-thinking',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Hello Claude' }] } as any],
+    })) {
+      claudeChunks.push(chunk)
+    }
+
+    assert.equal(claudeChunks.length, 1)
+    const claudeFinish = claudeChunks[0]!
+    assert.equal(claudeFinish.type, 'finish')
+    if (claudeFinish.type === 'finish') {
+      assert.equal(claudeFinish.reason.kind, 'error')
+      const failure = (claudeFinish.reason as any).failure
+      assert.equal(failure?.code, 'RATE_LIMIT')
+      assert.match(failure?.message || '', /anthropic/)
+      assert.match(failure?.message || '', /quota exhausted/i)
+      assert.match(failure?.message || '', /Resets in/i)
+      assert.doesNotMatch(failure?.message || '', /AUTH_REQUIRED/)
+    }
+  })
+
+  it('stream yields AUTH_REQUIRED when all accounts are quarantined or no accounts exist', async () => {
+    const pool = new AccountPoolManager('/tmp/dsh-test-pool-no-auth-' + Date.now())
+    const acc = pool.getAccounts()[0]!
+    pool.markAuthRequired(acc.id, 'Invalid token')
+
+    const catalog = new ModelCatalog(
+      undefined,
+      [{ id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 Thinking' }],
+      60_000,
+    )
+
+    const adapter = new AgyAdapter({
+      getConfig: () => defaultConfig(),
+      catalog,
+      pool,
+    })
+
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'antigravity',
+      model: 'claude-opus-4-6-thinking',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] } as any],
+    })) {
+      chunks.push(chunk)
+    }
+
+    assert.equal(chunks.length, 1)
+    const finish = chunks[0]!
+    assert.equal(finish.type, 'finish')
+    if (finish.type === 'finish') {
+      assert.equal(finish.reason.kind, 'error')
+      const failure = (finish.reason as any).failure
+      assert.equal(failure?.code, 'AUTH_REQUIRED')
+      assert.match(failure?.message || '', /No authenticated Antigravity account available/)
+    }
+  })
 })

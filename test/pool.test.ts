@@ -139,7 +139,18 @@ test('Corrupt pool.json recovers gracefully', () => {
   assert.equal(pool.getAccounts()[0]?.id, 'acc_primary')
 })
 
-import { parseResetDurationMs } from '../src/common/types.ts'
+import { formatDuration, parseResetDurationMs } from '../src/common/types.ts'
+
+test('formatDuration formats milliseconds into human-readable duration', () => {
+  assert.equal(formatDuration(0), '0s')
+  assert.equal(formatDuration(45_000), '45s')
+  assert.equal(formatDuration(60_000), '1m')
+  assert.equal(formatDuration(75_000), '1m 15s')
+  assert.equal(formatDuration(3600_000), '1h')
+  assert.equal(formatDuration(7320_000), '2h 2m')
+  assert.equal(formatDuration(86400_000), '1d')
+  assert.equal(formatDuration(90000_000), '1d 1h')
+})
 
 test('parseResetDurationMs parses various rate limit durations', () => {
   // Compact durations
@@ -292,5 +303,56 @@ test('sweepOldLogs sweeps log files older than retention days', () => {
   assert.ok(swept >= 1)
   assert.equal(existsSync(oldLog), false)
   assert.equal(existsSync(freshLog), true)
+})
+
+test('getFamilyStatus accurately reports health, suppression and reset countdown', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-status-'))
+  const pool = new AccountPoolManager(dir)
+  const accPrimary = pool.getAccounts()[0]!
+
+  // 1. Initial healthy primary account
+  const googleStatus = pool.getFamilyStatus('google')
+  assert.equal(googleStatus.hasAccount, true)
+  assert.equal(googleStatus.suppressed, false)
+  assert.equal(googleStatus.resetInMs, null)
+
+  // 2. Set anthropic quota exhausted with reset in 2 hours
+  const twoHoursFuture = new Date(Date.now() + 7200_000).toISOString()
+  pool.updateAccountQuotas(accPrimary.id, {
+    anthropic: {
+      remainingFraction: 0.0,
+      resetTime: twoHoursFuture,
+    },
+    google: {
+      remainingFraction: 0.8,
+    },
+  })
+
+  const anthropicStatus = pool.getFamilyStatus('anthropic')
+  assert.equal(anthropicStatus.hasAccount, true)
+  assert.equal(anthropicStatus.suppressed, true)
+  assert.equal(anthropicStatus.reason, 'quota_exhausted')
+  assert.ok(typeof anthropicStatus.resetInMs === 'number' && anthropicStatus.resetInMs > 7000_000)
+
+  // Google remains healthy!
+  const googleStatusAfter = pool.getFamilyStatus('google')
+  assert.equal(googleStatusAfter.hasAccount, true)
+  assert.equal(googleStatusAfter.suppressed, false)
+
+  // 3. Mark primary as authRequired -> hasAccount becomes false
+  pool.markAuthRequired(accPrimary.id, 'Invalid token')
+  const authReqStatus = pool.getFamilyStatus('google')
+  assert.equal(authReqStatus.hasAccount, false)
+  assert.equal(authReqStatus.suppressed, false)
+  assert.equal(authReqStatus.reason, 'auth_required')
+
+  // 4. Rate-limited account reports 'rate_limited'
+  pool.clearAuthRequired(accPrimary.id)
+  pool.recordFailure(accPrimary.id, 'google', '429 Rate Limit')
+  const rateLimitStatus = pool.getFamilyStatus('google')
+  assert.equal(rateLimitStatus.hasAccount, true)
+  assert.equal(rateLimitStatus.suppressed, true)
+  assert.equal(rateLimitStatus.reason, 'rate_limited')
+  assert.ok(typeof rateLimitStatus.resetInMs === 'number' && rateLimitStatus.resetInMs > 0)
 })
 

@@ -9,6 +9,7 @@ import {
   type AccountPoolData,
   type FamilyCooldownState,
   type FamilyQuotaInfo,
+  type FamilyStatus,
   type ManagedAccount,
   type ModelFamily,
 } from '../common/pool-types.ts'
@@ -604,20 +605,80 @@ export class AccountPoolManager {
   }
 
   /**
-   * Get countdown in milliseconds until the earliest account in cooldown resets.
+   * Get countdown in milliseconds until the earliest account in cooldown or quota resets.
    */
   getEarliestResetCountdown(family: ModelFamily): number | null {
     const now = Date.now()
     let earliest: number | null = null
     for (const acc of this.data.accounts) {
-      if (!acc.enabled) continue
+      if (!acc.enabled || acc.authRequired) continue
+      let accReset: number | null = null
       const cd = acc.cooldowns[family]
       if (cd && cd.cooldownUntil > now) {
-        if (earliest === null || cd.cooldownUntil < earliest) {
-          earliest = cd.cooldownUntil
+        accReset = Math.max(accReset ?? 0, cd.cooldownUntil)
+      }
+      const quota = acc.quotas[family]
+      if (quota && typeof quota.remainingFraction === 'number' && quota.remainingFraction <= 0.02) {
+        if (quota.resetTime) {
+          const resetMs = Date.parse(quota.resetTime)
+          if (!Number.isNaN(resetMs) && resetMs > now) {
+            accReset = Math.max(accReset ?? 0, resetMs)
+          }
+        }
+      }
+      if (quota && typeof quota.weeklyFraction === 'number' && quota.weeklyFraction <= 0.01) {
+        if (quota.weeklyResetTime) {
+          const resetMs = Date.parse(quota.weeklyResetTime)
+          if (!Number.isNaN(resetMs) && resetMs > now) {
+            accReset = Math.max(accReset ?? 0, resetMs)
+          }
+        }
+      }
+      if (accReset !== null) {
+        if (earliest === null || accReset < earliest) {
+          earliest = accReset
         }
       }
     }
     return earliest !== null ? Math.max(0, earliest - now) : null
+  }
+
+  /**
+   * Inspect availability and suppression status for a given model family across the pool.
+   */
+  getFamilyStatus(family: ModelFamily): FamilyStatus {
+    const accounts = this.data.accounts
+    if (accounts.length === 0) {
+      return { hasAccount: false, suppressed: false, reason: 'no_accounts', resetInMs: null }
+    }
+
+    const enabledAccounts = accounts.filter((a) => a.enabled)
+    if (enabledAccounts.length === 0) {
+      return { hasAccount: false, suppressed: false, reason: 'disabled', resetInMs: null }
+    }
+
+    const authValidAccounts = enabledAccounts.filter((a) => !a.authRequired)
+    if (authValidAccounts.length === 0) {
+      return { hasAccount: false, suppressed: false, reason: 'auth_required', resetInMs: null }
+    }
+
+    const candidate = this.selectAccount(family)
+    if (candidate) {
+      return { hasAccount: true, suppressed: false, resetInMs: null }
+    }
+
+    // Has authenticated accounts, but all are suppressed by cooldown / quota
+    const resetInMs = this.getEarliestResetCountdown(family)
+    const hasRateLimitCooldown = authValidAccounts.some(
+      (a) => a.cooldowns[family] && a.cooldowns[family]!.cooldownUntil > Date.now(),
+    )
+    const reason = hasRateLimitCooldown ? 'rate_limited' : 'quota_exhausted'
+
+    return {
+      hasAccount: true,
+      suppressed: true,
+      reason,
+      resetInMs,
+    }
   }
 }

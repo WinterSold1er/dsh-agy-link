@@ -85,6 +85,13 @@ export interface AccountHealthInfo {
   cooldownMs?: number
 }
 
+export interface FamilyStatus {
+  hasAccount: boolean
+  suppressed: boolean
+  reason?: 'quota_exhausted' | 'rate_limited' | 'auth_required' | 'disabled' | 'no_accounts' | string
+  resetInMs: number | null
+}
+
 /**
  * Whether the background quota poller should touch this account at all.
  * Disabled, auth-quarantined and cooldown accounts are skipped so automatic

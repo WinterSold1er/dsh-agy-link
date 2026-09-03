@@ -6,7 +6,7 @@ import {
   type LlmResolvedModelInfo,
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { PROVIDER_ID, type PluginConfig } from '../common/types.ts'
+import { PROVIDER_ID, formatDuration, type PluginConfig } from '../common/types.ts'
 import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import type { QuotaService } from './quota.ts'
@@ -164,9 +164,53 @@ export class AgyAdapter extends LlmAdapter {
             // Find another untried enabled candidate
             const alt = this.deps.pool
               .getAccounts()
-              .find((a) => a.enabled && !a.authRequired && !triedAccountIds.has(a.id))
-            if (alt) account = alt
+              .find((a) => {
+                if (!a.enabled || a.authRequired || triedAccountIds.has(a.id)) return false
+                const cd = a.cooldowns[family]
+                if (cd && cd.cooldownUntil > Date.now()) return false
+                const q = a.quotas[family]
+                if (q && typeof q.remainingFraction === 'number' && q.remainingFraction <= 0.02) {
+                  if (q.resetTime && Date.parse(q.resetTime) > Date.now()) return false
+                }
+                if (q && typeof q.weeklyFraction === 'number' && q.weeklyFraction <= 0.01) {
+                  if (q.weeklyResetTime && Date.parse(q.weeklyResetTime) > Date.now()) return false
+                }
+                return true
+              })
+            account = alt ?? null
           }
+        }
+
+        // If pool is present and no candidate account is available (and no env token override)
+        if (!account && this.deps.pool && !process.env.ANTIGRAVITY_TOKEN?.trim()) {
+          const status = this.deps.pool.getFamilyStatus(family)
+          if (status.suppressed) {
+            const resetMsg = status.resetInMs && status.resetInMs > 0
+              ? ` Resets in ${formatDuration(status.resetInMs)}.`
+              : ''
+            yield {
+              type: 'finish',
+              reason: {
+                kind: 'error',
+                failure: {
+                  message: `Antigravity quota exhausted for model family '${family}'.${resetMsg}`,
+                  code: 'RATE_LIMIT',
+                },
+              },
+            }
+            return
+          }
+          yield {
+            type: 'finish',
+            reason: {
+              kind: 'error',
+              failure: {
+                message: 'No authenticated Antigravity account available. Please sign in via /agy auth.',
+                code: 'AUTH_REQUIRED',
+              },
+            },
+          }
+          return
         }
 
         const accountId = account ? account.id : 'acc_default'
@@ -353,6 +397,25 @@ export class AgyAdapter extends LlmAdapter {
 
       // If loop exhausted with no emit
       if (!hasEmitted) {
+        if (this.deps.pool) {
+          const status = this.deps.pool.getFamilyStatus(family)
+          if (status.suppressed) {
+            const resetMsg = status.resetInMs && status.resetInMs > 0
+              ? ` Resets in ${formatDuration(status.resetInMs)}.`
+              : ''
+            yield {
+              type: 'finish',
+              reason: {
+                kind: 'error',
+                failure: {
+                  message: `Antigravity quota exhausted for model family '${family}'.${resetMsg}`,
+                  code: 'RATE_LIMIT',
+                },
+              },
+            }
+            return
+          }
+        }
         yield {
           type: 'finish',
           reason: {
