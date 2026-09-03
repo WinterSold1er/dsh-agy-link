@@ -25,7 +25,15 @@ type ForeignSource = { source?: { kind?: string; provider?: string } }
 function textOf(m: Message): string {
   const parts: string[] = []
   for (const b of m.content) {
-    if (b.type === 'text') parts.push(b.text)
+    if (b.type === 'text') {
+      parts.push(b.text)
+    } else if (b.type === 'tool-result') {
+      // Extract nested text from tool-result blocks so cold-start fallback
+      // prompt retains tool output (content is ContentBlock[]).
+      for (const inner of b.content) {
+        if (inner.type === 'text') parts.push(inner.text)
+      }
+    }
   }
   return parts.filter((s) => s !== '').join('\n')
 }
@@ -773,14 +781,30 @@ export class AgyAdapter extends LlmAdapter {
 }
 
 /**
- * Detect a continuation span: the request's LAST message is the tool result
- * of one of our mirrored agy tool calls. Its callId encodes the recording
- * run and the event index to resume after.
+ * Detect a continuation span: scan backward from the end of the message list,
+ * skipping plugin-injected user messages (source.kind === 'plugin'), to find
+ * the most recent tool-result message whose callId encodes a recording cursor.
+ *
+ * Stops and returns null when hitting a non-user message or a "real" user
+ * message (source.kind is 'user', undefined, or any non-'tool'/'plugin' kind)
+ * — that boundary means the user sent a new instruction, so continuation
+ * across it would be incorrect.
  */
 export function detectContinuation(messages: readonly Message[]): { runId: string; eventIndex: number } | null {
-  const last = messages[messages.length - 1]
-  if (last === undefined || last.role !== 'user') return null
-  const src = (last as unknown as { source?: { kind?: string; callId?: string } }).source
-  if (src === undefined || src.kind !== 'tool' || typeof src.callId !== 'string') return null
-  return parseMirrorCallId(src.callId)
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!
+    if (m.role !== 'user') return null
+    const src = (m as unknown as { source?: { kind?: string; callId?: string } }).source
+    // Plugin-injected context (e.g. dsh-hooks-claude-code working memory):
+    // skip and keep scanning backward.
+    if (src?.kind === 'plugin') continue
+    // Tool-result message: check for our mirror callId.
+    if (src?.kind === 'tool' && typeof src.callId === 'string') {
+      return parseMirrorCallId(src.callId)
+    }
+    // Any other user message (real user input, kind='user'/undefined/etc):
+    // this is a genuine user boundary — no continuation.
+    return null
+  }
+  return null
 }
