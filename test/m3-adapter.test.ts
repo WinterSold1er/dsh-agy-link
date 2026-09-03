@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
 import { AgyAdapter } from '../src/host/adapter.ts'
 import { ModelCatalog } from '../src/host/models.ts'
 import { AccountPoolManager } from '../src/host/pool.ts'
@@ -114,11 +115,118 @@ describe('M3: Adapter & Failover', () => {
     }
   })
 
+  it('mapSseStreamToChunks terminates with STREAM_EXCEPTION and closes active block on mid-stream transport error', async () => {
+    let emitted = false
+    const errorStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(
+            'data: {"response":{"candidates":[{"content":{"parts":[{"text":"Partial output"}]}}]}}\n\n',
+          ),
+        )
+        setTimeout(() => {
+          controller.error(new Error('Connection dropped unexpectedly'))
+        }, 10)
+      },
+    })
+
+    const mockResp = new Response(errorStream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })
+
+    const chunks: StreamChunk[] = []
+    for await (const chunk of mapSseStreamToChunks(mockResp, undefined, () => {
+      emitted = true
+    })) {
+      chunks.push(chunk)
+    }
+
+    assert.equal(emitted, true)
+    const types = chunks.map((c) => c.type)
+    assert.ok(types.includes('block-start'))
+    assert.ok(types.includes('text-delta'))
+    assert.ok(types.includes('block-end'))
+    assert.ok(types.includes('finish'))
+
+    const finish = chunks[chunks.length - 1]!
+    assert.equal(finish.type, 'finish')
+    if (finish.type === 'finish') {
+      assert.equal(finish.reason.kind, 'error')
+      assert.equal((finish.reason as any).failure?.code, 'STREAM_EXCEPTION')
+      assert.match((finish.reason as any).failure?.message || '', /Connection dropped/)
+    }
+  })
+
+  it('adapter pre-emission 429 fails over silently to second account in pool', async () => {
+    const pool = new AccountPoolManager('/tmp/dsh-test-pool-failover-' + Date.now())
+    const slot2 = pool.createAccountSlot('Account 2')
+    const accounts = pool.getAccounts()
+
+    pool.setMemoryToken(accounts[0]!.id, 'token-acc-1', Date.now() + 60_000)
+    pool.setMemoryToken(accounts[1]!.id, 'token-acc-2', Date.now() + 60_000)
+
+    const server = createServer((req, res) => {
+      if (req.headers.authorization === 'Bearer token-acc-1') {
+        res.writeHead(429, { 'Content-Type': 'text/plain' })
+        res.end('Rate limit exceeded')
+      } else if (req.headers.authorization === 'Bearer token-acc-2') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+        res.write(
+          'data: {"response":{"candidates":[{"content":{"parts":[{"text":"Success from failover account"}]}}]}}\n\n',
+        )
+        res.write('data: {"response":{"candidates":[{"finishReason":"STOP"}]}}\n\n')
+        res.end()
+      } else {
+        res.writeHead(404)
+        res.end()
+      }
+    })
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve())
+    })
+    const port = (server.address() as { port: number }).port
+    const endpoint = `http://127.0.0.1:${port}`
+
+    try {
+      const catalog = new ModelCatalog(undefined, [{ id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash' }], 60_000)
+      const adapter = new AgyAdapter({
+        getConfig: () => defaultConfig(),
+        catalog,
+        pool,
+        endpointCandidates: [endpoint],
+      })
+
+      const chunks: StreamChunk[] = []
+      for await (const chunk of adapter.stream({
+        provider: 'antigravity',
+        model: 'gemini-3.7-flash',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] } as any],
+      })) {
+        chunks.push(chunk)
+      }
+
+      const textChunk = chunks.find((c) => c.type === 'text-delta')
+      assert.ok(textChunk)
+      assert.equal((textChunk as any).text, 'Success from failover account')
+
+      const finishChunk = chunks.find((c) => c.type === 'finish')
+      assert.ok(finishChunk)
+      assert.equal((finishChunk as any).reason.kind, 'stop')
+    } finally {
+      server.close()
+    }
+  })
+
   it('prepareCall resolves model aliases properly', async () => {
-    const catalog = new ModelCatalog(undefined, [
-      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
-      { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' },
-    ], 60_000)
+    const catalog = new ModelCatalog(
+      undefined,
+      [
+        { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+        { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' },
+      ],
+      60_000,
+    )
 
     const adapter = new AgyAdapter({
       getConfig: () => defaultConfig(),

@@ -223,3 +223,27 @@ test('ModelCatalog with empty discoverer output does not set phantom lastError o
 })
 
 
+
+test('getAntigravityRequestModelId and resolveModelSlug robustness on unknown, uppercase, and versioned model strings', () => {
+  // Uppercase & whitespace aliases
+  assert.equal(resolveModelSlug('SONNET'), 'claude-sonnet-4-6')
+  assert.equal(resolveModelSlug('  sonnet  '), 'claude-sonnet-4-6')
+  assert.equal(resolveModelSlug('OPUS'), 'claude-opus-4-6-thinking')
+  assert.equal(resolveModelSlug('Claude-Sonnet-4.6'), 'claude-sonnet-4-6')
+  assert.equal(resolveModelSlug('claude-opus-4-8'), 'claude-opus-4-6-thinking')
+  assert.equal(resolveModelSlug('gpt-oss-20b'), 'gpt-oss-120b-medium')
+
+  // Unknown models passthrough cleanly
+  assert.equal(resolveModelSlug('custom-gemini-v1'), 'custom-gemini-v1')
+  assert.equal(getAntigravityRequestModelId('custom-gemini-v1'), 'custom-gemini-v1')
+
+  // Uppercase routing
+  assert.equal(getAntigravityRequestModelId('SONNET'), 'claude-sonnet-4-6')
+  assert.equal(getAntigravityRequestModelId('gemini-3.7-flash', 'HIGH'), 'gemini-3.7-flash-high')
+  assert.equal(getAntigravityRequestModelId('gemini-3.7-flash', 'LOW'), 'gemini-3.7-flash-low')
+
+  // Non-standard / invalid effort falls back safely to high/default without throwing
+  assert.equal(getAntigravityRequestModelId('gemini-3.7-flash', 'invalid_effort'), 'gemini-3.7-flash-high')
+  assert.equal(getAntigravityRequestModelId('gemini-3.7-flash', 'off'), 'gemini-3.7-flash-low')
+  assert.equal(getAntigravityRequestModelId('gemini-3.7-flash', ''), 'gemini-3.7-flash-low')
+})

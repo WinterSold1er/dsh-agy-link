@@ -1,5 +1,6 @@
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
 import {
   ensureProject,
   loadCodeAssist,
@@ -84,5 +85,56 @@ describe('M1: Core Client & Auth', () => {
     } finally {
       delete process.env.ANTIGRAVITY_TOKEN
     }
+  })
+
+  it('ensureProject resolves project id via onboarding LRO polling mock', async () => {
+    let getOpCalls = 0
+    const server = createServer((req, res) => {
+      if (req.url?.includes('loadCodeAssist')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({}))
+      } else if (req.url?.includes('onboardUser')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ done: false, name: 'operations/op-test-123' }))
+      } else if (req.url?.includes('getOperation')) {
+        getOpCalls++
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            done: true,
+            name: 'operations/op-test-123',
+            response: { cloudaicompanionProject: { id: 'lro-project-success' } },
+          }),
+        )
+      } else {
+        res.writeHead(404)
+        res.end()
+      }
+    })
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve())
+    })
+    const port = (server.address() as { port: number }).port
+    const endpoint = `http://127.0.0.1:${port}`
+
+    try {
+      const proj = await ensureProject('token-lro', 'user-seed', undefined, [endpoint])
+      assert.equal(proj, 'lro-project-success')
+      assert.equal(getOpCalls, 1)
+
+      // Second call hits in-memory LRU cache without hitting server
+      const cached = await ensureProject('token-lro', 'user-seed', undefined, [endpoint])
+      assert.equal(cached, 'lro-project-success')
+      assert.equal(getOpCalls, 1)
+    } finally {
+      server.close()
+    }
+  })
+
+  it('ensureProject falls back to deterministic project id when endpoints fail', async () => {
+    const badEndpoint = 'http://127.0.0.1:59999'
+    const proj = await ensureProject('token-fail', 'user@example.com', undefined, [badEndpoint])
+    assert.equal(proj, stableProjectId('user@example.com'))
   })
 })

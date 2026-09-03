@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
+import { BlockAssembler, type CallId, type Message, type ToolSchema } from '@deepseek-ai/dsh-llm'
 import {
   convertTools,
   dereferenceSchema,
@@ -232,6 +232,22 @@ describe('M2: Converters & Sanitizer', () => {
       assert.equal((contents[0]!.parts[0] as { text: string }).text, 'Hello')
       assert.equal(contents[1]!.role, 'model')
     })
+
+    it('convertMessages handles empty messages array and empty content safely', async () => {
+      const empty = await convertMessages([])
+      assert.deepEqual(empty, [])
+
+      const msgsEmptyContent: Message[] = [
+        {
+          id: 'm3' as any,
+          source: { kind: 'user' } as any,
+          role: 'user',
+          content: [],
+        },
+      ]
+      const converted = await convertMessages(msgsEmptyContent)
+      assert.deepEqual(converted, [])
+    })
   })
 
   describe('SSE Mapper', () => {
@@ -259,6 +275,27 @@ describe('M2: Converters & Sanitizer', () => {
       const safety = createFinishReason('SAFETY', false)
       assert.equal(safety.kind, 'error')
       assert.ok('failure' in safety)
+    })
+
+    it('finish reason kind matches dsh-llm FinishReason whitelist', () => {
+      const allowedKinds = new Set(['stop', 'tool-calls', 'max-tokens', 'aborted', 'error'])
+
+      const r1 = createFinishReason(undefined, false)
+      const r2 = createFinishReason('STOP', false)
+      const r3 = createFinishReason('STOP', true)
+      const r4 = createFinishReason('MAX_TOKENS', false)
+      const r5 = createFinishReason('SAFETY', false)
+      const r6 = createFinishReason('RECITATION', false)
+      const r7 = createFinishReason('UNKNOWN_REASON', false)
+
+      for (const r of [r1, r2, r3, r4, r5, r6, r7]) {
+        assert.ok(allowedKinds.has(r.kind), `kind "${r.kind}" must be in allowed FinishReason kinds`)
+      }
+
+      assert.equal(mapFinishReason(undefined, false), 'stop')
+      assert.equal(mapFinishReason('STOP', true), 'tool-calls')
+      assert.equal(mapFinishReason('MAX_TOKENS', false), 'max-tokens')
+      assert.equal(mapFinishReason('SAFETY', false), 'error')
     })
 
     it('mapSseStreamToChunks maps SSE stream to DSH StreamChunks with incremental tool deltas', async () => {
@@ -294,6 +331,86 @@ describe('M2: Converters & Sanitizer', () => {
       assert.ok(finishChunk)
       assert.equal(typeof finishChunk.reason, 'object')
       assert.equal(finishChunk.reason.kind, 'tool-calls')
+    })
+
+    it('BlockAssembler incrementally stitches multiple tool-call-delta slices into valid JSON', () => {
+      const assembler = new BlockAssembler()
+
+      assembler.push({ type: 'block-start', index: 0, blockType: 'tool-call' })
+      assembler.push({
+        type: 'tool-call-delta',
+        index: 0,
+        id: 'call_multi' as CallId,
+        name: 'write_file',
+        argumentsDelta: '{"path": "test.txt", ',
+      })
+      assembler.push({
+        type: 'tool-call-delta',
+        index: 0,
+        id: 'call_multi' as CallId,
+        name: 'write_file',
+        argumentsDelta: '"content": "hello world", ',
+      })
+      assembler.push({
+        type: 'tool-call-delta',
+        index: 0,
+        id: 'call_multi' as CallId,
+        argumentsDelta: '"mode": 420}',
+      })
+      assembler.push({ type: 'finish', reason: { kind: 'tool-calls' } })
+
+      const blocks = assembler.blocks()
+      assert.equal(blocks.length, 1)
+      const tc = blocks[0]!
+      assert.equal(tc.type, 'tool-call')
+      if (tc.type === 'tool-call') {
+        assert.equal(tc.id, 'call_multi')
+        assert.equal(tc.name, 'write_file')
+        const parsed = JSON.parse(tc.arguments)
+        assert.deepEqual(parsed, { path: 'test.txt', content: 'hello world', mode: 420 })
+      }
+
+      const msg = assembler.message()
+      assert.equal(msg.role, 'assistant')
+      assert.equal(msg.content.length, 1)
+    })
+
+    it('BlockAssembler end-to-end consumes mapSseStreamToChunks output stream with reasoning, text, tool calls, and usage', async () => {
+      const ssePayload = [
+        'data: {"response":{"candidates":[{"content":{"parts":[{"thought":true,"text":"Thinking step 1... "}]}}]}}\n\n',
+        'data: {"response":{"candidates":[{"content":{"parts":[{"thought":true,"text":"Thinking step 2"}]}}]}}\n\n',
+        'data: {"response":{"candidates":[{"content":{"parts":[{"text":"Executing command: "}]}}]}}\n\n',
+        'data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_e2e","name":"bash","args":{"command":"pwd"}}}]}}],"usageMetadata":{"promptTokenCount":250,"cachedContentTokenCount":50,"candidatesTokenCount":30,"thoughtsTokenCount":20}}}\n\n',
+        'data: {"response":{"candidates":[{"finishReason":"STOP"}]}}\n\n',
+      ].join('')
+
+      const mockResponse = new Response(ssePayload, {
+        headers: { 'Content-Type': 'text/event-stream' },
+      })
+
+      const assembler = new BlockAssembler()
+      for await (const chunk of mapSseStreamToChunks(mockResponse)) {
+        assembler.push(chunk)
+      }
+
+      const blocks = assembler.blocks()
+      assert.equal(blocks.length, 3)
+      assert.equal(blocks[0]?.type, 'reasoning')
+      assert.equal((blocks[0] as any).text, 'Thinking step 1... Thinking step 2')
+      assert.equal(blocks[1]?.type, 'text')
+      assert.equal((blocks[1] as any).text, 'Executing command: ')
+      assert.equal(blocks[2]?.type, 'tool-call')
+      assert.equal((blocks[2] as any).id, 'call_e2e')
+      assert.equal((blocks[2] as any).name, 'bash')
+      assert.deepEqual(JSON.parse((blocks[2] as any).arguments), { command: 'pwd' })
+
+      assert.deepEqual(assembler.usage, {
+        inputTokens: 200,
+        outputTokens: 50,
+        cacheReadTokens: 50,
+        reasoningTokens: 20,
+      })
+      assert.deepEqual(assembler.finish, { kind: 'tool-calls' })
     })
   })
 })
