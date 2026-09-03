@@ -19,10 +19,35 @@ export function defaultPoolDir(): string {
   return join(dshState, 'agy-accounts')
 }
 
+export class Semaphore {
+  private active = 0
+  private queue: Array<() => void> = []
+  constructor(private readonly max: () => number) {}
+  async acquire(): Promise<() => void> {
+    if (this.active < Math.max(1, this.max())) {
+      this.active++
+      return () => this.releaseOne()
+    }
+    return new Promise((resolve) => {
+      this.queue.push(() => {
+        this.active++
+        resolve(() => this.releaseOne())
+      })
+    })
+  }
+  private releaseOne(): void {
+    this.active--
+    const next = this.queue.shift()
+    if (next) next()
+  }
+}
+
 export class AccountPoolManager {
   private data: AccountPoolData
   private readonly baseDir: string
   private readonly file: string
+  private readonly activeMemoryTokens = new Map<string, { token: string; expiresAt: number }>()
+  private readonly accountSemaphores = new Map<string, Semaphore>()
 
   constructor(baseDir = defaultPoolDir()) {
     this.baseDir = baseDir
@@ -116,6 +141,36 @@ export class AccountPoolManager {
 
   getPoolData(): Readonly<AccountPoolData> {
     return this.data
+  }
+
+  setMemoryToken(id: string, token: string, expiresAt?: number): void {
+    this.activeMemoryTokens.set(id, {
+      token,
+      expiresAt: expiresAt ?? Date.now() + 55 * 60 * 1000,
+    })
+  }
+
+  getMemoryToken(id: string): string | null {
+    const entry = this.activeMemoryTokens.get(id)
+    if (!entry) return null
+    if (entry.expiresAt <= Date.now() + 10_000) {
+      this.activeMemoryTokens.delete(id)
+      return null
+    }
+    return entry.token
+  }
+
+  clearMemoryToken(id: string): void {
+    this.activeMemoryTokens.delete(id)
+  }
+
+  async acquireAccount(id: string, maxConcurrent = 1): Promise<() => void> {
+    let sem = this.accountSemaphores.get(id)
+    if (!sem) {
+      sem = new Semaphore(() => maxConcurrent)
+      this.accountSemaphores.set(id, sem)
+    }
+    return sem.acquire()
   }
 
   getAccounts(): readonly ManagedAccount[] {

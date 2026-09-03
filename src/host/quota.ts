@@ -259,6 +259,7 @@ export class QuotaService {
 
   /** Persist refreshed tokens back in the SAME on-disk shape agy wrote. */
   private persistRefreshedToken(account: ManagedAccount, tokens: { access_token: string; expiryMs?: number }): void {
+    this.pool.setMemoryToken(account.id, tokens.access_token, tokens.expiryMs)
     const file = this.getTokenFilePath(account)
     try {
       mkdirSync(dirname(file), { recursive: true })
@@ -291,11 +292,19 @@ export class QuotaService {
    * refresh works out of the box.
    */
   async getValidAccessToken(account: ManagedAccount): Promise<string | null> {
+    if (process.env.ANTIGRAVITY_TOKEN?.trim()) {
+      return process.env.ANTIGRAVITY_TOKEN.trim()
+    }
+
+    const mem = this.pool.getMemoryToken(account.id)
+    if (mem) return mem
+
     const tok = this.getStoredToken(account)
     if (!tok) return null
 
     // Still fresh (with 60s buffer)? Use it directly.
     if (tok.accessToken && (!tok.expiryMs || tok.expiryMs > Date.now() + 60_000)) {
+      this.pool.setMemoryToken(account.id, tok.accessToken, tok.expiryMs)
       return tok.accessToken
     }
 
