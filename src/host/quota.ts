@@ -203,8 +203,11 @@ export function readMacKeychainToken(): StoredToken | null {
 
 export class QuotaService {
   private preferredEndpointIndex = 0
+  private readonly pool: AccountPoolManager
 
-  constructor(private readonly pool: AccountPoolManager) {}
+  constructor(pool: AccountPoolManager) {
+    this.pool = pool
+  }
 
   private getTokenFilePath(account: ManagedAccount): string {
     // The primary account rides the real system HOME (Keychain-backed);

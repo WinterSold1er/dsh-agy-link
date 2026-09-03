@@ -22,7 +22,10 @@ export function defaultPoolDir(): string {
 export class Semaphore {
   private active = 0
   private queue: Array<() => void> = []
-  constructor(private readonly max: () => number) {}
+  private readonly max: () => number
+  constructor(max: () => number) {
+    this.max = max
+  }
   async acquire(): Promise<() => void> {
     if (this.active < Math.max(1, this.max())) {
       this.active++

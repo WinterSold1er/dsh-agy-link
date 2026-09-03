@@ -92,6 +92,8 @@ describe('M2: Converters & Sanitizer', () => {
       const fakeImageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03])
       const msgs: Message[] = [
         {
+          id: 'm1' as any,
+          source: { kind: 'user' } as any,
           role: 'user',
           content: [
             { type: 'text', text: 'Analyze this image:' },
@@ -163,6 +165,8 @@ describe('M2: Converters & Sanitizer', () => {
     it('prepends user hello if conversation starts with model', async () => {
       const msgs: Message[] = [
         {
+          id: 'm2' as any,
+          source: { kind: 'model', provider: 'antigravity', model: 'gemini-3.7-flash' } as any,
           role: 'assistant',
           content: [{ type: 'text', text: 'Hello, how can I help?' }],
         },

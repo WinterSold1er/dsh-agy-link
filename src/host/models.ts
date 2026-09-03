@@ -171,12 +171,16 @@ export type DiscoverFn = (signal?: AbortSignal) => Promise<{ stdout: string; std
 export class ModelCatalog {
   private current: Catalog;
   private refreshing: Promise<void> | null = null;
+  private readonly discover: DiscoverFn;
+  private readonly ttlMs: number;
 
   constructor(
-    private readonly discover: DiscoverFn,
+    discover: DiscoverFn,
     fallbackDefs: readonly FallbackModelDef[],
-    private readonly ttlMs: number,
+    ttlMs: number,
   ) {
+    this.discover = discover;
+    this.ttlMs = ttlMs;
     this.current = {
       source: 'fallback',
       models: buildFallbackCatalog(fallbackDefs),
