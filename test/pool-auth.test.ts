@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { AccountPoolManager } from '../src/host/pool.ts'
 import { PoolAuthFlow } from '../src/host/pool-auth.ts'
 import { QuotaService } from '../src/host/quota.ts'
+import { resolveClientCredentials, AGY_PUBLIC_CLIENT_SECRET } from '../src/host/oauth.ts'
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'agy-pool-auth-'))
@@ -82,4 +83,15 @@ test('PoolAuthFlow fails cleanly when the exchange is rejected', async () => {
     if (String(err).includes('fetch failed')) return // offline: skip
     throw err
   }
+})
+
+test('resolveClientCredentials returns valid public clientSecret format without extra hyphens', () => {
+  const creds = resolveClientCredentials()
+  assert.ok(creds.clientId.includes('.apps.googleusercontent.com'))
+  assert.ok(creds.clientSecret.startsWith('GOCSPX-'))
+  // Must have exactly 1 hyphen (GOCSPX-<secret>), not multiple like GOCSPX-LdL-J1mL
+  const hyphenCount = (creds.clientSecret.match(/-/g) || []).length
+  assert.equal(hyphenCount, 1)
+  assert.equal(creds.clientSecret.length, 35)
+  assert.equal(AGY_PUBLIC_CLIENT_SECRET, creds.clientSecret)
 })

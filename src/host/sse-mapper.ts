@@ -15,10 +15,13 @@ interface StreamPart {
   text?: string
   thought?: boolean
   thoughtSignature?: string
+  thought_signature?: string
   functionCall?: {
     id?: string
     name?: string
     args?: Record<string, unknown>
+    thoughtSignature?: string
+    thought_signature?: string
   }
 }
 
@@ -116,8 +119,8 @@ export async function* mapSseStreamToChunks(
 
   let blockIndex = 0
   let currentBlock:
-    | { type: 'text'; text: string; index: number }
-    | { type: 'reasoning'; text: string; index: number }
+    | { type: 'text'; text: string; index: number; thoughtSignature?: string }
+    | { type: 'reasoning'; text: string; index: number; thoughtSignature?: string }
     | null = null
 
   let lastUsage: TokenUsage | null = null
@@ -139,8 +142,16 @@ export async function* mapSseStreamToChunks(
       index: currentBlock.index,
       block:
         currentBlock.type === 'text'
-          ? { type: 'text', text: currentBlock.text }
-          : { type: 'reasoning', text: currentBlock.text },
+          ? ({
+              type: 'text',
+              text: currentBlock.text,
+              ...(currentBlock.thoughtSignature ? { thoughtSignature: currentBlock.thoughtSignature } : {}),
+            } as ContentBlock)
+          : ({
+              type: 'reasoning',
+              text: currentBlock.text,
+              ...(currentBlock.thoughtSignature ? { thoughtSignature: currentBlock.thoughtSignature } : {}),
+            } as ContentBlock),
     }
     currentBlock = null
     return chunk
@@ -216,19 +227,28 @@ export async function* mapSseStreamToChunks(
           if (part.text !== undefined) {
             const isThought = part.thought === true
             const blockType = isThought ? 'reasoning' : 'text'
+            const sig = part.thoughtSignature || part.thought_signature
 
             if (!currentBlock || currentBlock.type !== blockType) {
               const end = closeCurrentBlock()
               if (end) yield end
 
               const idx = blockIndex++
-              currentBlock = { type: blockType, text: '', index: idx }
+              currentBlock = {
+                type: blockType,
+                text: '',
+                index: idx,
+                ...(sig ? { thoughtSignature: sig } : {}),
+              }
               notifyFirstEmit()
               yield { type: 'block-start', index: idx, blockType }
             }
 
             const active = currentBlock!
             active.text += part.text
+            if (sig) {
+              active.thoughtSignature = sig
+            }
             notifyFirstEmit()
             if (isThought) {
               yield { type: 'reasoning-delta', index: active.index, text: part.text }
@@ -249,6 +269,11 @@ export async function* mapSseStreamToChunks(
               `call_${Date.now()}_${++toolCallGen}`
             const name = part.functionCall.name || 'tool'
             const fullArgs = JSON.stringify(part.functionCall.args || {})
+            const sig =
+              part.thoughtSignature ||
+              part.thought_signature ||
+              part.functionCall.thoughtSignature ||
+              part.functionCall.thought_signature
 
             notifyFirstEmit()
             yield { type: 'block-start', index: idx, blockType: 'tool-call' }
@@ -270,7 +295,8 @@ export async function* mapSseStreamToChunks(
                 id: rawId as CallId,
                 name,
                 arguments: fullArgs,
-              },
+                ...(sig ? { thoughtSignature: sig } : {}),
+              } as unknown as ContentBlock,
             }
           }
         }

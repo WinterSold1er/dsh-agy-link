@@ -248,6 +248,113 @@ describe('M2: Converters & Sanitizer', () => {
       const converted = await convertMessages(msgsEmptyContent)
       assert.deepEqual(converted, [])
     })
+
+    it('convertMessages preserves thoughtSignature on tool-call and reasoning blocks for multi-turn Gemini requests', async () => {
+      const validSig = 'YWJjZA=='
+      const msgs: Message[] = [
+        {
+          id: 'm1' as any,
+          source: { kind: 'user' } as any,
+          role: 'user',
+          content: [{ type: 'text', text: 'Read file hello.txt' }],
+        },
+        {
+          id: 'm2' as any,
+          source: { kind: 'model', provider: 'antigravity', model: 'gemini-3.7-flash' } as any,
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'Thinking about reading file...', thoughtSignature: validSig } as any,
+            {
+              type: 'tool-call',
+              id: 'call_read_1' as CallId,
+              name: 'default_api:read',
+              arguments: JSON.stringify({ file_path: './hello.txt' }),
+              thoughtSignature: validSig,
+            } as any,
+          ],
+        },
+        {
+          id: 'm3' as any,
+          source: { kind: 'user' } as any,
+          role: 'user',
+          content: [
+            {
+              type: 'tool-result',
+              toolCallId: 'call_read_1' as CallId,
+              content: [{ type: 'text', text: 'E2E_OK_12345' }],
+            } as any,
+          ],
+        },
+      ]
+
+      const contents = await convertMessages(msgs)
+      assert.equal(contents.length, 3)
+
+      // Turn 1: user text
+      assert.equal(contents[0]!.role, 'user')
+      assert.equal((contents[0]!.parts[0] as { text: string }).text, 'Read file hello.txt')
+
+      // Turn 2: model with thought + functionCall, both carrying thoughtSignature
+      assert.equal(contents[1]!.role, 'model')
+      assert.equal(contents[1]!.parts.length, 2)
+      const thoughtPart = contents[1]!.parts[0] as any
+      assert.equal(thoughtPart.thought, true)
+      assert.equal(thoughtPart.text, 'Thinking about reading file...')
+      assert.equal(thoughtPart.thoughtSignature, validSig)
+
+      const funcCallPart = contents[1]!.parts[1] as any
+      assert.ok(funcCallPart.functionCall)
+      assert.equal(funcCallPart.functionCall.name, 'default_api:read')
+      assert.equal(funcCallPart.functionCall.id, 'call_read_1')
+      assert.deepEqual(funcCallPart.functionCall.args, { file_path: './hello.txt' })
+      assert.equal(funcCallPart.thoughtSignature, validSig)
+
+      // Turn 3: user functionResponse correctly matched to preceding functionCall
+      assert.equal(contents[2]!.role, 'user')
+      assert.equal(contents[2]!.parts.length, 1)
+      const respPart = contents[2]!.parts[0] as any
+      assert.ok(respPart.functionResponse)
+      assert.equal(respPart.functionResponse.name, 'default_api:read')
+      assert.equal(respPart.functionResponse.id, 'call_read_1')
+      assert.deepEqual(respPart.functionResponse.response, { output: 'E2E_OK_12345' })
+    })
+
+    it('convertMessages handles unsigned or invalid signature tool-call and reasoning blocks', async () => {
+      const msgs: Message[] = [
+        {
+          id: 'm1' as any,
+          source: { kind: 'user' } as any,
+          role: 'user',
+          content: [{ type: 'text', text: 'Hello' }],
+        },
+        {
+          id: 'm2' as any,
+          source: { kind: 'model', provider: 'antigravity', model: 'gemini-3.7-flash' } as any,
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'Thinking without signature' } as any,
+            {
+              type: 'tool-call',
+              id: 'call_unsigned' as CallId,
+              name: 'bash',
+              arguments: JSON.stringify({ command: 'echo 1' }),
+            } as any,
+          ],
+        },
+      ]
+
+      const contents = await convertMessages(msgs)
+      assert.equal(contents.length, 2)
+      const modelParts = contents[1]!.parts
+      assert.equal(modelParts.length, 2)
+      // Unsigned reasoning degrades to text in sanitizeTopology
+      assert.equal('thought' in modelParts[0]!, false)
+      assert.equal((modelParts[0] as { text: string }).text, 'Thinking without signature')
+      // Unsigned tool-call retains functionCall but does not have thoughtSignature
+      const funcPart = modelParts[1] as any
+      assert.ok(funcPart.functionCall)
+      assert.equal(funcPart.thoughtSignature, undefined)
+    })
   })
 
   describe('SSE Mapper', () => {
@@ -411,6 +518,38 @@ describe('M2: Converters & Sanitizer', () => {
         reasoningTokens: 20,
       })
       assert.deepEqual(assembler.finish, { kind: 'tool-calls' })
+    })
+
+    it('mapSseStreamToChunks retains thoughtSignature on tool-call and reasoning blocks', async () => {
+      const sig1 = 'YWJjZA=='
+      const sig2 = 'ZGVmZw=='
+      const ssePayload = [
+        `data: {"response":{"candidates":[{"content":{"parts":[{"thought":true,"text":"Thinking...","thoughtSignature":"${sig1}"}]}}]}}\n\n`,
+        `data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_sig","name":"read_file","args":{"path":"test.txt"}},"thoughtSignature":"${sig2}"}]}}]}}\n\n`,
+        'data: {"response":{"candidates":[{"finishReason":"STOP"}]}}\n\n',
+      ].join('')
+
+      const mockResponse = new Response(ssePayload, {
+        headers: { 'Content-Type': 'text/event-stream' },
+      })
+
+      const chunks = []
+      for await (const chunk of mapSseStreamToChunks(mockResponse)) {
+        chunks.push(chunk)
+      }
+
+      const blockEnds = chunks.filter((c) => c.type === 'block-end') as any[]
+      assert.equal(blockEnds.length, 2)
+
+      // Reasoning block-end carries thoughtSignature
+      assert.equal(blockEnds[0].block.type, 'reasoning')
+      assert.equal(blockEnds[0].block.text, 'Thinking...')
+      assert.equal(blockEnds[0].block.thoughtSignature, sig1)
+
+      // Tool call block-end carries thoughtSignature
+      assert.equal(blockEnds[1].block.type, 'tool-call')
+      assert.equal(blockEnds[1].block.name, 'read_file')
+      assert.equal(blockEnds[1].block.thoughtSignature, sig2)
     })
   })
 })

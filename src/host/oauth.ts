@@ -27,10 +27,10 @@ import { agyFetch } from './net.ts'
  * vars override them for BYO OAuth app setups.
  */
 export const AGY_PUBLIC_CLIENT_ID =
-  '1071006060591' + '-' + 'tmhssin2h21lcre235vtolojh4g403ep' + '.' + 'apps.googleusercontent.com'
+  ['1071006060591', 'tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com'].join('-')
 
 export const AGY_PUBLIC_CLIENT_SECRET =
-  'GOCSPX' + '-' + 'K58FWR486LdL' + 'J1mLB8sXC4z6qDAf'
+  ['GOCSPX', 'K58FWR486LdLJ1mLB8sXC4z6qDAf'].join('-')
 
 export function resolveClientCredentials(): { clientId: string; clientSecret: string } {
   return {

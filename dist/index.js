@@ -24602,10 +24602,14 @@ async function convertMessages(messages, readImage, runtimeModel = "gemini-3.7-f
 		const parts = [];
 		for (const block of msg.content) if (block.type === "text") {
 			const text = block.text;
-			if (text) parts.push({ text: sanitizeText(text) });
+			const sig = block.thoughtSignature || block.thought_signature;
+			if (text) parts.push({
+				text: sanitizeText(text),
+				...isValidThoughtSignature(sig) ? { thoughtSignature: sig } : {}
+			});
 		} else if (block.type === "reasoning") {
 			const reasoning = block.text;
-			const sig = block.thoughtSignature;
+			const sig = block.thoughtSignature || block.thought_signature;
 			if (reasoning) {
 				if (isValidThoughtSignature(sig)) parts.push({
 					thought: true,
@@ -24616,7 +24620,7 @@ async function convertMessages(messages, readImage, runtimeModel = "gemini-3.7-f
 			}
 		} else if (block.type === "tool-call") {
 			const tc = block;
-			const sig = block.thoughtSignature;
+			const sig = block.thoughtSignature || block.thought_signature;
 			const functionCall = {
 				name: tc.name,
 				args: parseJsonArguments(tc.arguments),
@@ -24757,10 +24761,12 @@ async function* mapSseStreamToChunks(response, signal, onFirstEmit) {
 			index: currentBlock.index,
 			block: currentBlock.type === "text" ? {
 				type: "text",
-				text: currentBlock.text
+				text: currentBlock.text,
+				...currentBlock.thoughtSignature ? { thoughtSignature: currentBlock.thoughtSignature } : {}
 			} : {
 				type: "reasoning",
-				text: currentBlock.text
+				text: currentBlock.text,
+				...currentBlock.thoughtSignature ? { thoughtSignature: currentBlock.thoughtSignature } : {}
 			}
 		};
 		currentBlock = null;
@@ -24827,6 +24833,7 @@ async function* mapSseStreamToChunks(response, signal, onFirstEmit) {
 					if (part.text !== void 0) {
 						const isThought = part.thought === true;
 						const blockType = isThought ? "reasoning" : "text";
+						const sig = part.thoughtSignature || part.thought_signature;
 						if (!currentBlock || currentBlock.type !== blockType) {
 							const end = closeCurrentBlock();
 							if (end) yield end;
@@ -24834,7 +24841,8 @@ async function* mapSseStreamToChunks(response, signal, onFirstEmit) {
 							currentBlock = {
 								type: blockType,
 								text: "",
-								index: idx
+								index: idx,
+								...sig ? { thoughtSignature: sig } : {}
 							};
 							notifyFirstEmit();
 							yield {
@@ -24845,6 +24853,7 @@ async function* mapSseStreamToChunks(response, signal, onFirstEmit) {
 						}
 						const active = currentBlock;
 						active.text += part.text;
+						if (sig) active.thoughtSignature = sig;
 						notifyFirstEmit();
 						if (isThought) yield {
 							type: "reasoning-delta",
@@ -24865,6 +24874,7 @@ async function* mapSseStreamToChunks(response, signal, onFirstEmit) {
 						const rawId = part.functionCall.id || `call_${Date.now()}_${++toolCallGen}`;
 						const name = part.functionCall.name || "tool";
 						const fullArgs = JSON.stringify(part.functionCall.args || {});
+						const sig = part.thoughtSignature || part.thought_signature || part.functionCall.thoughtSignature || part.functionCall.thought_signature;
 						notifyFirstEmit();
 						yield {
 							type: "block-start",
@@ -24885,7 +24895,8 @@ async function* mapSseStreamToChunks(response, signal, onFirstEmit) {
 								type: "tool-call",
 								id: rawId,
 								name,
-								arguments: fullArgs
+								arguments: fullArgs,
+								...sig ? { thoughtSignature: sig } : {}
 							}
 						};
 					}
@@ -26133,10 +26144,20 @@ var AccountPoolManager = class {
 		return earliest !== null ? Math.max(0, earliest - now) : null;
 	}
 };
+//#endregion
+//#region src/host/oauth.ts
+/**
+* Public Google consumer-OAuth credentials shipped inside the Antigravity
+* desktop product and its agy CLI (also embedded in many public tools).
+* Not secrets owned by this project; AGY_CLIENT_ID / AGY_CLIENT_SECRET env
+* vars override them for BYO OAuth app setups.
+*/
+const AGY_PUBLIC_CLIENT_ID = ["1071006060591", "tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"].join("-");
+const AGY_PUBLIC_CLIENT_SECRET = ["GOCSPX", "K58FWR486LdLJ1mLB8sXC4z6qDAf"].join("-");
 function resolveClientCredentials() {
 	return {
-		clientId: process.env.AGY_CLIENT_ID || ["1071006060591", "tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"].join("-"),
-		clientSecret: process.env.AGY_CLIENT_SECRET || ["GOCSPX", "K58FWR486LdL", "J1mLB8sXC4z6qDAf"].join("-")
+		clientId: process.env.AGY_CLIENT_ID || AGY_PUBLIC_CLIENT_ID,
+		clientSecret: process.env.AGY_CLIENT_SECRET || AGY_PUBLIC_CLIENT_SECRET
 	};
 }
 /**

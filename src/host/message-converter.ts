@@ -182,10 +182,20 @@ export async function convertMessages(
       for (const block of msg.content) {
         if (block.type === 'text') {
           const text = (block as TextBlock).text
-          if (text) parts.push({ text: sanitizeText(text) })
+          const sig =
+            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thoughtSignature ||
+            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thought_signature
+          if (text) {
+            parts.push({
+              text: sanitizeText(text),
+              ...(isValidThoughtSignature(sig) ? { thoughtSignature: sig } : {}),
+            })
+          }
         } else if (block.type === 'reasoning') {
           const reasoning = (block as ReasoningBlock).text
-          const sig = (block as unknown as { thoughtSignature?: string }).thoughtSignature
+          const sig =
+            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thoughtSignature ||
+            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thought_signature
           if (reasoning) {
             if (isValidThoughtSignature(sig)) {
               parts.push({
@@ -200,7 +210,9 @@ export async function convertMessages(
           }
         } else if (block.type === 'tool-call') {
           const tc = block as ToolCallBlock
-          const sig = (block as unknown as { thoughtSignature?: string }).thoughtSignature
+          const sig =
+            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thoughtSignature ||
+            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thought_signature
           const functionCall: GeminiFunctionCallPart['functionCall'] = {
             name: tc.name,
             args: parseJsonArguments(tc.arguments),
