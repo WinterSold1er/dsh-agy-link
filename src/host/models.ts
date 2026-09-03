@@ -171,13 +171,13 @@ export type DiscoverFn = (signal?: AbortSignal) => Promise<{ stdout: string; std
 export class ModelCatalog {
   private current: Catalog;
   private refreshing: Promise<void> | null = null;
-  private readonly discover: DiscoverFn;
+  private readonly discover?: DiscoverFn;
   private readonly ttlMs: number;
 
   constructor(
-    discover: DiscoverFn,
-    fallbackDefs: readonly FallbackModelDef[],
-    ttlMs: number,
+    discover?: DiscoverFn,
+    fallbackDefs: readonly FallbackModelDef[] = [],
+    ttlMs: number = 300_000,
   ) {
     this.discover = discover;
     this.ttlMs = ttlMs;
@@ -194,6 +194,7 @@ export class ModelCatalog {
 
   /** Refresh if stale; never throws — failures keep the previous catalog. */
   async refreshIfNeeded(): Promise<void> {
+    if (!this.discover) return;
     if (this.refreshing) return this.refreshing;
     const age = Date.now() - this.current.discoveredAt;
     if (this.current.source === 'discovered' && age < this.ttlMs) return;
@@ -204,11 +205,13 @@ export class ModelCatalog {
   }
 
   async forceRefresh(): Promise<Catalog> {
+    if (!this.discover) return this.current;
     await this.refresh();
     return this.current;
   }
 
   private async refresh(): Promise<void> {
+    if (!this.discover) return;
     try {
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), 30_000);
@@ -217,6 +220,11 @@ export class ModelCatalog {
         const raw = parseModelsOutput(stdout);
         if (raw.length > 0) {
           this.current = { source: 'discovered', models: foldEfforts(raw), discoveredAt: Date.now() };
+          return;
+        }
+        if (this.current.source === 'fallback') {
+          const { lastError: _, ...rest } = this.current;
+          this.current = rest;
           return;
         }
         this.current = { ...this.current, lastError: 'agy models returned no entries' };
@@ -231,10 +239,22 @@ export class ModelCatalog {
 
 export function resolveModelSlug(id: string): string {
   const s = id.trim().toLowerCase()
-  if (s === 'claude-opus-4-6' || s === 'claude-opus-4-8' || s === 'claude-opus' || s === 'claude-opus-4.6' || s === 'claude-opus-4-5') {
+  if (
+    s === 'claude-opus-4-6' ||
+    s === 'claude-opus-4-8' ||
+    s === 'claude-opus' ||
+    s === 'claude-opus-4.6' ||
+    s === 'claude-opus-4-5' ||
+    s === 'opus'
+  ) {
     return 'claude-opus-4-6-thinking'
   }
-  if (s === 'claude-sonnet' || s === 'claude-sonnet-4.6' || s === 'claude-sonnet-4-5') {
+  if (
+    s === 'claude-sonnet' ||
+    s === 'claude-sonnet-4.6' ||
+    s === 'claude-sonnet-4-5' ||
+    s === 'sonnet'
+  ) {
     return 'claude-sonnet-4-6'
   }
   if (s === 'gpt-oss-120b' || s === 'gpt-oss-20b' || s === 'gpt-oss') {
@@ -396,11 +416,12 @@ export function getMaxOutputTokens(modelId: string, runtimeModel?: string): numb
 }
 
 export function getAntigravityRequestModelId(modelId: string, effort?: string): string {
-  const r = ANTIGRAVITY_ROUTING[modelId]
-  if (!r) return resolveModelSlug(modelId)
+  const resolvedId = resolveModelSlug(modelId)
+  const r = ANTIGRAVITY_ROUTING[resolvedId] ?? ANTIGRAVITY_ROUTING[modelId]
+  if (!r) return resolvedId
 
   if (effort === undefined || effort === 'off' || effort === '') {
-    return r.off ?? r.routing?.minimal ?? r.routing?.low ?? r.defaultRequestId ?? modelId
+    return r.off ?? r.routing?.minimal ?? r.routing?.low ?? r.defaultRequestId ?? resolvedId
   }
 
   const effortKey = effort.toLowerCase() as 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
@@ -411,7 +432,7 @@ export function getAntigravityRequestModelId(modelId: string, effort?: string): 
     r.routing?.minimal ??
     r.off ??
     r.defaultRequestId ??
-    modelId
+    resolvedId
   )
 }
 

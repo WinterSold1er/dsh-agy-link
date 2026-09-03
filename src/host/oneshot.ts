@@ -102,7 +102,7 @@ export async function runAgyOnce(
   try {
     const requestedModel = req.model || cfg.defaultModel || 'gemini-3.7-flash'
     const wireModel = getAntigravityRequestModelId(requestedModel, req.effort)
-    const isClaude = requestedModel.startsWith('claude-')
+    const isClaude = wireModel.startsWith('claude-')
     const maxTokens = getMaxOutputTokens(requestedModel, wireModel)
     const thinkingConfig = getThinkingConfig(requestedModel, req.effort)
 
@@ -111,7 +111,7 @@ export async function runAgyOnce(
       prompt = await inlineFiles(prompt, req.readPaths, process.cwd())
     }
 
-    const family = modelFamilyOf(requestedModel)
+    const family = modelFamilyOf(wireModel)
     const account = deps.pool?.selectAccount(family)
     const accountId = account?.id || 'acc_default'
 

@@ -1,6 +1,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildFallbackCatalog, defaultEffortFor, findEntry, foldEfforts, parseModelsOutput } from '../src/host/models.ts'
+import {
+  ModelCatalog,
+  buildFallbackCatalog,
+  defaultEffortFor,
+  findEntry,
+  foldEfforts,
+  getAntigravityRequestModelId,
+  parseModelsOutput,
+  resolveModelSlug,
+} from '../src/host/models.ts'
 import { DEFAULT_FALLBACK_MODELS, defaultConfig, type PluginConfig } from '../src/common/types.ts'
 
 test('parseModelsOutput reads the JSON array shape', () => {
@@ -168,6 +177,49 @@ test('findEntry resolves aliases via resolveModelSlug', () => {
   const cat = { source: 'fallback' as const, models: buildFallbackCatalog(DEFAULT_FALLBACK_MODELS), discoveredAt: 0 }
   assert.equal(findEntry(cat, 'claude-opus-4-6')?.id, 'claude-opus-4-6-thinking')
   assert.equal(findEntry(cat, 'claude-opus')?.id, 'claude-opus-4-6-thinking')
+  assert.equal(findEntry(cat, 'opus')?.id, 'claude-opus-4-6-thinking')
+  assert.equal(findEntry(cat, 'sonnet')?.id, 'claude-sonnet-4-6')
+  assert.equal(findEntry(cat, 'claude-sonnet')?.id, 'claude-sonnet-4-6')
   assert.equal(findEntry(cat, 'gpt-oss-120b')?.id, 'gpt-oss-120b-medium')
+  assert.equal(findEntry(cat, 'gpt-oss')?.id, 'gpt-oss-120b-medium')
 })
+
+test('getAntigravityRequestModelId resolves aliases to wire models', () => {
+  assert.equal(getAntigravityRequestModelId('sonnet'), 'claude-sonnet-4-6')
+  assert.equal(getAntigravityRequestModelId('claude-sonnet'), 'claude-sonnet-4-6')
+  assert.equal(getAntigravityRequestModelId('opus'), 'claude-opus-4-6-thinking')
+  assert.equal(getAntigravityRequestModelId('claude-opus'), 'claude-opus-4-6-thinking')
+  assert.equal(getAntigravityRequestModelId('gpt-oss'), 'gpt-oss-120b-medium')
+  assert.equal(getAntigravityRequestModelId('gpt-oss-120b'), 'gpt-oss-120b-medium')
+  assert.equal(getAntigravityRequestModelId('gemini-3.7-flash', 'high'), 'gemini-3.7-flash-high')
+})
+
+test('ModelCatalog with undefined discoverer stays on fallback with no lastError', async () => {
+  const catalog = new ModelCatalog(undefined, DEFAULT_FALLBACK_MODELS, 60_000)
+  assert.equal(catalog.get().source, 'fallback')
+  assert.equal(catalog.get().lastError, undefined)
+  assert.ok(catalog.get().models.length > 0)
+
+  await catalog.refreshIfNeeded()
+  assert.equal(catalog.get().lastError, undefined)
+
+  const refreshed = await catalog.forceRefresh()
+  assert.equal(refreshed.source, 'fallback')
+  assert.equal(refreshed.lastError, undefined)
+})
+
+test('ModelCatalog with empty discoverer output does not set phantom lastError on fallback', async () => {
+  const catalog = new ModelCatalog(
+    async () => ({ stdout: '', stderr: '' }),
+    DEFAULT_FALLBACK_MODELS,
+    60_000,
+  )
+  assert.equal(catalog.get().source, 'fallback')
+  assert.equal(catalog.get().lastError, undefined)
+
+  const refreshed = await catalog.forceRefresh()
+  assert.equal(refreshed.source, 'fallback')
+  assert.equal(refreshed.lastError, undefined)
+})
+
 

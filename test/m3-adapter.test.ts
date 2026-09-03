@@ -113,4 +113,26 @@ describe('M3: Adapter & Failover', () => {
       assert.match(finish.reason.failure?.message || '', /Resource exhausted/)
     }
   })
+
+  it('prepareCall resolves model aliases properly', async () => {
+    const catalog = new ModelCatalog(undefined, [
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+      { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' },
+    ], 60_000)
+
+    const adapter = new AgyAdapter({
+      getConfig: () => defaultConfig(),
+      catalog,
+    })
+
+    const preparedSonnet = await adapter.prepareCall('antigravity', 'sonnet')
+    assert.equal(preparedSonnet.model.id, 'sonnet')
+    assert.equal(preparedSonnet.model.name, 'Claude Sonnet 4.6')
+    assert.equal(preparedSonnet.model.context?.contextWindow, 200_000)
+
+    const preparedGpt = await adapter.prepareCall('antigravity', 'gpt-oss')
+    assert.equal(preparedGpt.model.id, 'gpt-oss')
+    assert.equal(preparedGpt.model.name, 'GPT-OSS 120B')
+    assert.equal(preparedGpt.model.context?.contextWindow, 200_000)
+  })
 })

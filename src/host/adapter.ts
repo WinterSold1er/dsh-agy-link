@@ -138,10 +138,10 @@ export class AgyAdapter extends LlmAdapter {
     const releaseGlobal = this.deps.acquire ? await this.deps.acquire() : null
 
     try {
-      const family = modelFamilyOf(options.model)
-      const isClaude = options.model.startsWith('claude-')
-      const isGptOss = options.model.startsWith('gpt-oss-')
       const wireModel = getAntigravityRequestModelId(options.model, options.reasoningEffort)
+      const isClaude = wireModel.startsWith('claude-')
+      const isGptOss = wireModel.startsWith('gpt-oss-')
+      const family = modelFamilyOf(wireModel)
       const maxTokens = options.maxTokens ?? getMaxOutputTokens(options.model, wireModel)
       const thinkingConfig = getThinkingConfig(options.model, options.reasoningEffort)
 

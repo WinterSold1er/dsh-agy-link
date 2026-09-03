@@ -77,9 +77,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const semaphore = new Semaphore(() => getConfig().maxConcurrent)
 
   const catalog = new ModelCatalog(
-    async () => {
-      return { stdout: '', stderr: '' }
-    },
+    undefined,
     getConfig().fallbackModels,
     getConfig().modelsCacheTtlMs,
   )

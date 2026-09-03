@@ -19,6 +19,8 @@ import {
   mapFinishReason,
   mapSseStreamToChunks,
 } from '../src/host/sse-mapper.ts'
+import { getAntigravityRequestModelId } from '../src/host/models.ts'
+import { antigravityRequestEnvelope } from '../src/host/client.ts'
 
 describe('M2: Converters & Sanitizer', () => {
   describe('Schema Converter', () => {
@@ -76,6 +78,58 @@ describe('M2: Converters & Sanitizer', () => {
       assert.equal(cmdProp.type, 'string')
       assert.equal(cmdProp.nullable, undefined)
       assert.equal(cmdProp.extraKeyword, undefined)
+    })
+
+    it('derives legacy schema and envelope labels for model aliases via wireModel', () => {
+      const tools: ToolSchema[] = [
+        {
+          name: 'exec',
+          description: 'Execute',
+          parameters: {
+            type: 'object',
+            properties: { cmd: { type: 'string' } },
+            required: ['cmd'],
+          },
+        },
+      ]
+
+      // Alias: sonnet -> claude-sonnet-4-6
+      const wireSonnet = getAntigravityRequestModelId('sonnet')
+      const isClaudeSonnet = wireSonnet.startsWith('claude-')
+      const isGptOssSonnet = wireSonnet.startsWith('gpt-oss-')
+      assert.equal(wireSonnet, 'claude-sonnet-4-6')
+      assert.equal(isClaudeSonnet, true)
+      const convertedSonnet = convertTools(tools, isClaudeSonnet || isGptOssSonnet)
+      assert.ok(convertedSonnet?.[0]?.functionDeclarations[0]?.parameters)
+      assert.equal(convertedSonnet?.[0]?.functionDeclarations[0]?.parametersJsonSchema, undefined)
+
+      const envSonnet = antigravityRequestEnvelope(wireSonnet, isClaudeSonnet)
+      assert.equal(envSonnet.labels.used_claude, 'true')
+      assert.equal(envSonnet.labels.used_claude_conservative, 'true')
+
+      // Alias: gpt-oss -> gpt-oss-120b-medium
+      const wireGptOss = getAntigravityRequestModelId('gpt-oss')
+      const isClaudeGptOss = wireGptOss.startsWith('claude-')
+      const isGptOssGptOss = wireGptOss.startsWith('gpt-oss-')
+      assert.equal(wireGptOss, 'gpt-oss-120b-medium')
+      assert.equal(isGptOssGptOss, true)
+      const convertedGptOss = convertTools(tools, isClaudeGptOss || isGptOssGptOss)
+      assert.ok(convertedGptOss?.[0]?.functionDeclarations[0]?.parameters)
+      assert.equal(convertedGptOss?.[0]?.functionDeclarations[0]?.parametersJsonSchema, undefined)
+
+      const envGptOss = antigravityRequestEnvelope(wireGptOss, isClaudeGptOss)
+      assert.equal(envGptOss.labels.used_claude, 'false')
+
+      // Gemini wireModel -> modern schema
+      const wireGemini = getAntigravityRequestModelId('gemini-3.7-flash', 'high')
+      const isClaudeGemini = wireGemini.startsWith('claude-')
+      const isGptOssGemini = wireGemini.startsWith('gpt-oss-')
+      const convertedGemini = convertTools(tools, isClaudeGemini || isGptOssGemini)
+      assert.ok(convertedGemini?.[0]?.functionDeclarations[0]?.parametersJsonSchema)
+      assert.equal(convertedGemini?.[0]?.functionDeclarations[0]?.parameters, undefined)
+
+      const envGemini = antigravityRequestEnvelope(wireGemini, isClaudeGemini)
+      assert.equal(envGemini.labels.used_claude, 'false')
     })
   })
 
