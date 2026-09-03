@@ -7,9 +7,11 @@ import {
   findEntry,
   foldEfforts,
   getAntigravityRequestModelId,
+  getThinkingConfig,
   parseModelsOutput,
   resolveModelSlug,
 } from '../src/host/models.ts'
+import { AgyAdapter } from '../src/host/adapter.ts'
 import { DEFAULT_FALLBACK_MODELS, defaultConfig, type PluginConfig } from '../src/common/types.ts'
 
 test('parseModelsOutput reads the JSON array shape', () => {
@@ -58,13 +60,16 @@ test('parseModelsOutput handles dotted current-gen slugs', () => {
   assert.deepEqual(base?.efforts, ['medium'])
 })
 
-test('fallback catalog carries the current model line-up incl. 3.7', () => {
+test('fallback catalog carries the current model line-up incl. 3.8 and 3.7', () => {
   const cat = buildFallbackCatalog(DEFAULT_FALLBACK_MODELS)
   const ids = cat.map((e) => e.id)
+  assert.ok(ids.includes('gemini-3.8-flash'), '3.8 flash present')
   assert.ok(ids.includes('gemini-3.7-flash'), '3.7 flash present')
   assert.ok(ids.includes('gemini-3.6-flash'))
   assert.ok(ids.includes('claude-opus-4-6-thinking'))
   assert.ok(ids.includes('gpt-oss-120b-medium'))
+  const f38 = findEntry({ source: 'fallback', models: cat, discoveredAt: 0 }, 'gemini-3.8-flash')
+  assert.deepEqual(f38?.efforts, ['low', 'medium', 'high'])
   const f37 = findEntry({ source: 'fallback', models: cat, discoveredAt: 0 }, 'gemini-3.7-flash')
   assert.deepEqual(f37?.efforts, ['low', 'medium', 'high'])
 })
@@ -144,7 +149,9 @@ test('bare gemini base without siblings gets no efforts', () => {
 
 test('buildFallbackCatalog carries configurable efforts', () => {
   const cat = buildFallbackCatalog(DEFAULT_FALLBACK_MODELS)
-  assert.equal(cat.length, 7)
+  assert.equal(cat.length, 8)
+  const flash38 = cat.find((e) => e.id === 'gemini-3.8-flash')
+  assert.deepEqual(flash38?.efforts, ['low', 'medium', 'high'])
   const flash = cat.find((e) => e.id === 'gemini-3.7-flash')
   assert.deepEqual(flash?.efforts, ['low', 'medium', 'high'])
   const claude = cat.find((e) => e.id === 'claude-sonnet-4-6')
@@ -192,6 +199,12 @@ test('getAntigravityRequestModelId resolves aliases to wire models', () => {
   assert.equal(getAntigravityRequestModelId('gpt-oss'), 'gpt-oss-120b-medium')
   assert.equal(getAntigravityRequestModelId('gpt-oss-120b'), 'gpt-oss-120b-medium')
   assert.equal(getAntigravityRequestModelId('gemini-3.7-flash', 'high'), 'gemini-3.7-flash-high')
+  assert.equal(getAntigravityRequestModelId('gemini-3.8-flash', 'high'), 'gemini-3.8-flash-high')
+  assert.equal(getAntigravityRequestModelId('gemini-3.8-flash', 'medium'), 'gemini-3.8-flash-medium')
+  assert.equal(getAntigravityRequestModelId('gemini-3.8-flash', 'low'), 'gemini-3.8-flash-low')
+  assert.equal(getAntigravityRequestModelId('gemini-3.8-flash', 'off'), 'gemini-3.8-flash-low')
+  assert.equal(getAntigravityRequestModelId('gemini-3.8-flash'), 'gemini-3.8-flash-low')
+  assert.equal(getAntigravityRequestModelId('gemini-3.8-flash-tiered'), 'gemini-3.8-flash-tiered')
 })
 
 test('ModelCatalog with undefined discoverer stays on fallback with no lastError', async () => {
@@ -246,4 +259,63 @@ test('getAntigravityRequestModelId and resolveModelSlug robustness on unknown, u
   assert.equal(getAntigravityRequestModelId('gemini-3.7-flash', 'invalid_effort'), 'gemini-3.7-flash-high')
   assert.equal(getAntigravityRequestModelId('gemini-3.7-flash', 'off'), 'gemini-3.7-flash-low')
   assert.equal(getAntigravityRequestModelId('gemini-3.7-flash', ''), 'gemini-3.7-flash-low')
+  assert.equal(getAntigravityRequestModelId('gemini-3.8-flash', 'invalid_effort'), 'gemini-3.8-flash-high')
+  assert.equal(getAntigravityRequestModelId('gemini-3.8-flash', 'off'), 'gemini-3.8-flash-low')
+  assert.equal(getAntigravityRequestModelId('gemini-3.8-flash', ''), 'gemini-3.8-flash-low')
 })
+
+test('getThinkingConfig handles 3.8, future 3.x and preserves legacy budgets', () => {
+  assert.deepEqual(getThinkingConfig('gemini-3.8-flash', 'high'), {
+    includeThoughts: true,
+    thinkingLevel: 'HIGH',
+  })
+  assert.deepEqual(getThinkingConfig('gemini-3.8-flash', 'medium'), {
+    includeThoughts: true,
+    thinkingLevel: 'MEDIUM',
+  })
+  assert.deepEqual(getThinkingConfig('gemini-3.8-flash', 'low'), {
+    includeThoughts: true,
+    thinkingLevel: 'LOW',
+  })
+  assert.deepEqual(getThinkingConfig('gemini-3.8-flash'), {
+    includeThoughts: true,
+    thinkingLevel: 'LOW',
+  })
+  // Generalized future 3.x prefix
+  assert.deepEqual(getThinkingConfig('gemini-3.9-flash', 'high'), {
+    includeThoughts: true,
+    thinkingLevel: 'HIGH',
+  })
+  // Preserved 3.5 & 3.1 budget behavior
+  assert.deepEqual(getThinkingConfig('gemini-3.5-flash', 'high'), {
+    includeThoughts: true,
+    thinkingBudget: 10_000,
+  })
+  assert.deepEqual(getThinkingConfig('gemini-3.1-pro', 'high'), {
+    includeThoughts: true,
+    thinkingBudget: 10_001,
+  })
+  // Claude / other non-gemini returns undefined
+  assert.equal(getThinkingConfig('claude-sonnet-4-6'), undefined)
+})
+
+test('resolveModel preserves 3.8 efforts, context window and max output tokens', async () => {
+  const catalog = new ModelCatalog(undefined, DEFAULT_FALLBACK_MODELS, 60_000)
+  const adapter = new AgyAdapter({
+    getConfig: () => defaultConfig(),
+    catalog,
+  })
+
+  const resolved = await adapter.resolveModel('antigravity', 'gemini-3.8-flash')
+  assert.equal(resolved.provider, 'antigravity')
+  assert.equal(resolved.id, 'gemini-3.8-flash')
+  assert.equal(resolved.name, 'Gemini 3.8 Flash')
+  assert.equal(resolved.context?.contextWindow, 1_048_576)
+  assert.equal(resolved.defaultMaxTokens, 65536)
+  assert.deepEqual(
+    resolved.reasoning?.efforts?.map((e) => e.name),
+    ['low', 'medium', 'high'],
+  )
+  assert.equal(resolved.reasoning?.defaultEffort, 'high')
+})
+

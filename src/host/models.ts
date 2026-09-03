@@ -329,6 +329,17 @@ export const ANTIGRAVITY_ROUTING: Record<string, AntigravityRouting> = {
     },
     defaultRequestId: 'gemini-3.1-pro-low',
   },
+  'gemini-3.8-flash': {
+    off: 'gemini-3.8-flash-low',
+    routing: {
+      minimal: 'gemini-3.8-flash-low',
+      low: 'gemini-3.8-flash-low',
+      medium: 'gemini-3.8-flash-medium',
+      high: 'gemini-3.8-flash-high',
+      xhigh: 'gemini-3.8-flash-high',
+    },
+    defaultRequestId: 'gemini-3.8-flash-low',
+  },
   'gemini-3.7-flash': {
     off: 'gemini-3.7-flash-low',
     routing: {
@@ -375,6 +386,11 @@ export const ANTIGRAVITY_ROUTING: Record<string, AntigravityRouting> = {
 }
 
 export const RUNTIME_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  'gemini-3.8-flash': 65536,
+  'gemini-3.8-flash-tiered': 65536,
+  'gemini-3.8-flash-low': 65536,
+  'gemini-3.8-flash-medium': 65536,
+  'gemini-3.8-flash-high': 65536,
   'gemini-3.7-flash': 65536,
   'gemini-3.7-flash-tiered': 65536,
   'gemini-3.7-flash-low': 65536,
@@ -437,6 +453,15 @@ export function getAntigravityRequestModelId(modelId: string, effort?: string): 
 }
 
 export function getFallbackRuntimeModel(runtimeModel: string, effort?: string): string | undefined {
+  if (runtimeModel === 'gemini-3.8-flash-tiered') {
+    return getAntigravityRequestModelId('gemini-3.7-flash', effort)
+  }
+  if (runtimeModel.startsWith('gemini-3.8-flash-')) {
+    return runtimeModel.replace('gemini-3.8-flash-', 'gemini-3.7-flash-')
+  }
+  if (runtimeModel === 'gemini-3.8-flash') {
+    return 'gemini-3.7-flash-low'
+  }
   if (runtimeModel === 'gemini-3.7-flash-tiered') {
     return getAntigravityRequestModelId('gemini-3.6-flash', effort)
   }
@@ -464,7 +489,14 @@ function googleLevel(effort: string | undefined): GeminiThinkingLevel {
 }
 
 export function getThinkingConfig(modelId: string, effort?: string): ThinkingWire | undefined {
-  if (modelId === 'gemini-3.7-flash' || modelId === 'gemini-3.6-flash') {
+  if (
+    modelId === 'gemini-3.8-flash' ||
+    modelId === 'gemini-3.7-flash' ||
+    modelId === 'gemini-3.6-flash' ||
+    (modelId.startsWith('gemini-3.') &&
+      !modelId.startsWith('gemini-3.5') &&
+      !modelId.startsWith('gemini-3.1'))
+  ) {
     return { includeThoughts: true, thinkingLevel: googleLevel(effort) }
   }
   if (modelId === 'gemini-3.5-flash') {

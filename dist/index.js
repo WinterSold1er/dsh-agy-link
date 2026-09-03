@@ -21,6 +21,15 @@ const DEFAULT_ENDPOINT_CANDIDATES = [
 ];
 const DEFAULT_FALLBACK_MODELS = [
 	{
+		id: "gemini-3.8-flash",
+		name: "Gemini 3.8 Flash",
+		efforts: [
+			"low",
+			"medium",
+			"high"
+		]
+	},
+	{
 		id: "gemini-3.7-flash",
 		name: "Gemini 3.7 Flash",
 		efforts: [
@@ -556,6 +565,17 @@ const ANTIGRAVITY_ROUTING = {
 		},
 		defaultRequestId: "gemini-3.1-pro-low"
 	},
+	"gemini-3.8-flash": {
+		off: "gemini-3.8-flash-low",
+		routing: {
+			minimal: "gemini-3.8-flash-low",
+			low: "gemini-3.8-flash-low",
+			medium: "gemini-3.8-flash-medium",
+			high: "gemini-3.8-flash-high",
+			xhigh: "gemini-3.8-flash-high"
+		},
+		defaultRequestId: "gemini-3.8-flash-low"
+	},
 	"gemini-3.7-flash": {
 		off: "gemini-3.7-flash-low",
 		routing: {
@@ -601,6 +621,11 @@ const ANTIGRAVITY_ROUTING = {
 	}
 };
 const RUNTIME_MAX_OUTPUT_TOKENS = {
+	"gemini-3.8-flash": 65536,
+	"gemini-3.8-flash-tiered": 65536,
+	"gemini-3.8-flash-low": 65536,
+	"gemini-3.8-flash-medium": 65536,
+	"gemini-3.8-flash-high": 65536,
 	"gemini-3.7-flash": 65536,
 	"gemini-3.7-flash-tiered": 65536,
 	"gemini-3.7-flash-low": 65536,
@@ -649,7 +674,7 @@ function googleLevel(effort) {
 	return "LOW";
 }
 function getThinkingConfig(modelId, effort) {
-	if (modelId === "gemini-3.7-flash" || modelId === "gemini-3.6-flash") return {
+	if (modelId === "gemini-3.8-flash" || modelId === "gemini-3.7-flash" || modelId === "gemini-3.6-flash" || modelId.startsWith("gemini-3.") && !modelId.startsWith("gemini-3.5") && !modelId.startsWith("gemini-3.1")) return {
 		includeThoughts: true,
 		thinkingLevel: googleLevel(effort)
 	};
@@ -24977,7 +25002,7 @@ var AgyAdapter = class extends LlmAdapter {
 		const wireModel = resolveModelSlug(model);
 		const isClaude = wireModel.startsWith("claude-");
 		const isGptOss = wireModel.startsWith("gpt-oss-");
-		const contextWindow = isClaude || isGptOss ? 2e5 : wireModel.includes("3.5") || wireModel.includes("3.6") || wireModel.includes("3.7") ? 1048576 : cfg.contextWindowDefault;
+		const contextWindow = isClaude || isGptOss ? 2e5 : wireModel.startsWith("gemini-") || wireModel.includes("3.5") || wireModel.includes("3.6") || wireModel.includes("3.7") || wireModel.includes("3.8") ? 1048576 : cfg.contextWindowDefault;
 		const maxTokens = getMaxOutputTokens(model, wireModel);
 		const resolved = {
 			provider,

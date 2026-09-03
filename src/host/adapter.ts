@@ -85,7 +85,11 @@ export class AgyAdapter extends LlmAdapter {
     const contextWindow =
       isClaude || isGptOss
         ? 200_000
-        : wireModel.includes('3.5') || wireModel.includes('3.6') || wireModel.includes('3.7')
+        : wireModel.startsWith('gemini-') ||
+            wireModel.includes('3.5') ||
+            wireModel.includes('3.6') ||
+            wireModel.includes('3.7') ||
+            wireModel.includes('3.8')
           ? 1_048_576
           : cfg.contextWindowDefault
     const maxTokens = getMaxOutputTokens(model, wireModel)
