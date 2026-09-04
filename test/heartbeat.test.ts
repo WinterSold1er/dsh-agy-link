@@ -138,7 +138,7 @@ test('HeartbeatManager triggerHeartbeat logs errors without throwing', async () 
   heartbeat.dispose()
 })
 
-test('HeartbeatManager dispose stops timer and clears subagents', () => {
+test('HeartbeatManager dispose stops timer, clears subagents, and ignores subsequent starts', () => {
   const { deps } = createMockDeps()
   const heartbeat = new HeartbeatManager(deps)
 
@@ -150,6 +150,28 @@ test('HeartbeatManager dispose stops timer and clears subagents', () => {
   heartbeat.dispose()
   assert.equal(heartbeat.getStatus().isRunning, false)
   assert.equal(heartbeat.getStatus().activeSubagents, 0)
+
+  // Subagent event arriving after dispose must not restart timer
+  heartbeat.onSubagentStart('sub-after-dispose')
+  assert.equal(heartbeat.getStatus().isRunning, false)
+  assert.equal(heartbeat.getStatus().activeSubagents, 0)
+})
+
+test('HeartbeatManager triggerHeartbeat does not set lastPingOk to true when no accounts have valid token', async () => {
+  const { deps, pings } = createMockDeps({
+    quota: {
+      getValidAccessToken: async () => null,
+    } as unknown as QuotaService,
+  })
+  const heartbeat = new HeartbeatManager(deps)
+  await (heartbeat as unknown as { triggerHeartbeat: () => Promise<void> }).triggerHeartbeat()
+
+  assert.equal(pings.length, 0)
+  const status = heartbeat.getStatus()
+  assert.equal(status.lastPingOk, undefined)
+  assert.equal(status.lastPingAt, undefined)
+
+  heartbeat.dispose()
 })
 
 test('config resolution supports heartbeatEnabled and heartbeatIntervalMs', () => {
@@ -172,7 +194,11 @@ test('config resolution supports heartbeatEnabled and heartbeatIntervalMs', () =
   const envCfg = resolveConfig(undefined, {
     DSH_AGY_HEARTBEAT_ENABLED: 'false',
     DSH_AGY_HEARTBEAT_INTERVAL_MS: '45000',
+    DSH_AGY_TIMEOUT_MS: '0',
+    DSH_AGY_MAX_CONCURRENT: '0',
   })
   assert.equal(envCfg.heartbeatEnabled, false)
   assert.equal(envCfg.heartbeatIntervalMs, 45_000)
+  assert.equal(envCfg.timeoutMs, 0)
+  assert.equal(envCfg.maxConcurrent, 0)
 })

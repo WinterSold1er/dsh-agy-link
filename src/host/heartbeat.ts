@@ -24,6 +24,7 @@ export class HeartbeatManager {
   private anonymousCount = 0
   private timer: NodeJS.Timeout | null = null
   private inFlight = false
+  private disposed = false
   private lastPingAt?: number
   private lastPingOk?: boolean
 
@@ -32,6 +33,7 @@ export class HeartbeatManager {
   }
 
   onSubagentStart(subagentId?: string): void {
+    if (this.disposed) return
     if (subagentId) {
       this.activeSubagentIds.add(subagentId)
     } else {
@@ -43,6 +45,7 @@ export class HeartbeatManager {
   }
 
   onSubagentEnd(subagentId?: string): void {
+    if (this.disposed) return
     if (subagentId) {
       this.activeSubagentIds.delete(subagentId)
     } else if (this.anonymousCount > 0) {
@@ -55,7 +58,7 @@ export class HeartbeatManager {
   }
 
   private startTimer(): void {
-    if (this.timer) return
+    if (this.disposed || this.timer) return
     const cfg = this.deps.getConfig()
     if (!cfg.heartbeatEnabled) return
     const interval = Math.max(30_000, cfg.heartbeatIntervalMs || 180_000)
@@ -72,7 +75,7 @@ export class HeartbeatManager {
   }
 
   private async triggerHeartbeat(): Promise<void> {
-    if (this.inFlight) return
+    if (this.disposed || this.inFlight) return
     this.inFlight = true
     try {
       const cfg = this.deps.getConfig()
@@ -89,19 +92,23 @@ export class HeartbeatManager {
         return
       }
 
-      const ping = this.deps.pingFn ?? loadCodeAssist
+      const ping = this.deps.pingFn ?? ((t, p, c) => loadCodeAssist(t, p, c, true))
       const customEndpoints = cfg.endpointCandidates as string[]
 
+      let pingCount = 0
       const results = await Promise.allSettled(
         accounts.map(async (acc) => {
           const token = await this.deps.quota.getValidAccessToken(acc)
           if (!token) return
+          pingCount++
           await ping(token, acc.proxyUrl, customEndpoints)
         }),
       )
 
-      this.lastPingAt = Date.now()
-      this.lastPingOk = !results.some((r) => r.status === 'rejected')
+      if (pingCount > 0) {
+        this.lastPingAt = Date.now()
+        this.lastPingOk = !results.some((r) => r.status === 'rejected')
+      }
 
       for (const r of results) {
         if (r.status === 'rejected') {
@@ -118,6 +125,7 @@ export class HeartbeatManager {
   }
 
   dispose(): void {
+    this.disposed = true
     this.stopTimer()
     this.activeSubagentIds.clear()
     this.anonymousCount = 0

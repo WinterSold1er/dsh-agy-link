@@ -128,24 +128,24 @@ export function resolveConfig(
   if (env.ANTIGRAVITY_BASE_URL) cfg.baseUrl = env.ANTIGRAVITY_BASE_URL
   if (env.DSH_AGY_DEFAULT_MODEL) cfg.defaultModel = env.DSH_AGY_DEFAULT_MODEL
   if (env.DSH_AGY_DEFAULT_EFFORT) cfg.defaultEffort = env.DSH_AGY_DEFAULT_EFFORT
-  if (env.DSH_AGY_TIMEOUT_MS) {
+  if (env.DSH_AGY_TIMEOUT_MS !== undefined) {
     const n = asNum(env.DSH_AGY_TIMEOUT_MS)
-    if (n) cfg.timeoutMs = n
+    if (n !== undefined) cfg.timeoutMs = n
   }
-  if (env.DSH_AGY_MAX_CONCURRENT) {
+  if (env.DSH_AGY_MAX_CONCURRENT !== undefined) {
     const n = asNum(env.DSH_AGY_MAX_CONCURRENT)
-    if (n) cfg.maxConcurrent = n
+    if (n !== undefined) cfg.maxConcurrent = n
   }
-  if (env.DSH_AGY_QUOTA_POLL_INTERVAL_MS) {
+  if (env.DSH_AGY_QUOTA_POLL_INTERVAL_MS !== undefined) {
     const n = asNum(env.DSH_AGY_QUOTA_POLL_INTERVAL_MS)
-    if (n) cfg.quotaPollIntervalMs = Math.max(60_000, n)
+    if (n !== undefined) cfg.quotaPollIntervalMs = Math.max(60_000, n)
   }
   if (env.DSH_AGY_HEARTBEAT_ENABLED !== undefined) {
     cfg.heartbeatEnabled = asBool(env.DSH_AGY_HEARTBEAT_ENABLED) ?? cfg.heartbeatEnabled
   }
-  if (env.DSH_AGY_HEARTBEAT_INTERVAL_MS) {
+  if (env.DSH_AGY_HEARTBEAT_INTERVAL_MS !== undefined) {
     const n = asNum(env.DSH_AGY_HEARTBEAT_INTERVAL_MS)
-    if (n) cfg.heartbeatIntervalMs = Math.max(30_000, n)
+    if (n !== undefined) cfg.heartbeatIntervalMs = Math.max(30_000, n)
   }
 
   return cfg

@@ -223,12 +223,15 @@ export async function loadCodeAssist(
   token: string,
   proxyUrl?: string,
   customEndpoints?: string[],
+  bypassCache = false,
 ): Promise<string | undefined> {
-  const cached = projectCache.get(token)
-  if (cached && cached.expiresAt > Date.now()) {
-    projectCache.delete(token)
-    projectCache.set(token, cached)
-    return cached.projectId
+  if (!bypassCache) {
+    const cached = projectCache.get(token)
+    if (cached && cached.expiresAt > Date.now()) {
+      projectCache.delete(token)
+      projectCache.set(token, cached)
+      return cached.projectId
+    }
   }
 
   const body = JSON.stringify({

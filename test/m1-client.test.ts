@@ -137,4 +137,42 @@ describe('M1: Core Client & Auth', () => {
     const proj = await ensureProject('token-fail', 'user@example.com', undefined, [badEndpoint])
     assert.equal(proj, stableProjectId('user@example.com'))
   })
+
+  it('loadCodeAssist bypassCache flag bypasses in-memory projectCache', async () => {
+    let callCount = 0
+    const server = createServer((req, res) => {
+      if (req.url?.includes('loadCodeAssist')) {
+        callCount++
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ projectId: `proj-${callCount}` }))
+      } else {
+        res.writeHead(404)
+        res.end()
+      }
+    })
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve())
+    })
+    const port = (server.address() as { port: number }).port
+    const endpoint = `http://127.0.0.1:${port}`
+
+    try {
+      const p1 = await loadCodeAssist('token-bypass-test', undefined, [endpoint])
+      assert.equal(p1, 'proj-1')
+      assert.equal(callCount, 1)
+
+      // Cached call with default bypassCache = false
+      const p2 = await loadCodeAssist('token-bypass-test', undefined, [endpoint])
+      assert.equal(p2, 'proj-1')
+      assert.equal(callCount, 1)
+
+      // Bypassed call with bypassCache = true
+      const p3 = await loadCodeAssist('token-bypass-test', undefined, [endpoint], true)
+      assert.equal(p3, 'proj-2')
+      assert.equal(callCount, 2)
+    } finally {
+      server.close()
+    }
+  })
 })

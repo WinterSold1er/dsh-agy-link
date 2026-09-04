@@ -241,22 +241,22 @@ function resolveConfig(entry, env = process.env, overrides = readOverrides()) {
 	if (env.ANTIGRAVITY_BASE_URL) cfg.baseUrl = env.ANTIGRAVITY_BASE_URL;
 	if (env.DSH_AGY_DEFAULT_MODEL) cfg.defaultModel = env.DSH_AGY_DEFAULT_MODEL;
 	if (env.DSH_AGY_DEFAULT_EFFORT) cfg.defaultEffort = env.DSH_AGY_DEFAULT_EFFORT;
-	if (env.DSH_AGY_TIMEOUT_MS) {
+	if (env.DSH_AGY_TIMEOUT_MS !== void 0) {
 		const n = asNum(env.DSH_AGY_TIMEOUT_MS);
-		if (n) cfg.timeoutMs = n;
+		if (n !== void 0) cfg.timeoutMs = n;
 	}
-	if (env.DSH_AGY_MAX_CONCURRENT) {
+	if (env.DSH_AGY_MAX_CONCURRENT !== void 0) {
 		const n = asNum(env.DSH_AGY_MAX_CONCURRENT);
-		if (n) cfg.maxConcurrent = n;
+		if (n !== void 0) cfg.maxConcurrent = n;
 	}
-	if (env.DSH_AGY_QUOTA_POLL_INTERVAL_MS) {
+	if (env.DSH_AGY_QUOTA_POLL_INTERVAL_MS !== void 0) {
 		const n = asNum(env.DSH_AGY_QUOTA_POLL_INTERVAL_MS);
-		if (n) cfg.quotaPollIntervalMs = Math.max(6e4, n);
+		if (n !== void 0) cfg.quotaPollIntervalMs = Math.max(6e4, n);
 	}
 	if (env.DSH_AGY_HEARTBEAT_ENABLED !== void 0) cfg.heartbeatEnabled = asBool(env.DSH_AGY_HEARTBEAT_ENABLED) ?? cfg.heartbeatEnabled;
-	if (env.DSH_AGY_HEARTBEAT_INTERVAL_MS) {
+	if (env.DSH_AGY_HEARTBEAT_INTERVAL_MS !== void 0) {
 		const n = asNum(env.DSH_AGY_HEARTBEAT_INTERVAL_MS);
-		if (n) cfg.heartbeatIntervalMs = Math.max(3e4, n);
+		if (n !== void 0) cfg.heartbeatIntervalMs = Math.max(3e4, n);
 	}
 	return cfg;
 }
@@ -24354,12 +24354,14 @@ async function listCloudAICompanionProjects(token, proxyUrl, customEndpoints) {
 /**
 * Discover project ID via loadCodeAssist (with 30-min in-memory LRU cache keyed by token).
 */
-async function loadCodeAssist(token, proxyUrl, customEndpoints) {
-	const cached = projectCache.get(token);
-	if (cached && cached.expiresAt > Date.now()) {
-		projectCache.delete(token);
-		projectCache.set(token, cached);
-		return cached.projectId;
+async function loadCodeAssist(token, proxyUrl, customEndpoints, bypassCache = false) {
+	if (!bypassCache) {
+		const cached = projectCache.get(token);
+		if (cached && cached.expiresAt > Date.now()) {
+			projectCache.delete(token);
+			projectCache.set(token, cached);
+			return cached.projectId;
+		}
 	}
 	const body = JSON.stringify({ metadata: {
 		ideType: "ANTIGRAVITY",
@@ -27284,23 +27286,26 @@ var HeartbeatManager = class {
 	anonymousCount = 0;
 	timer = null;
 	inFlight = false;
+	disposed = false;
 	lastPingAt;
 	lastPingOk;
 	constructor(deps) {
 		this.deps = deps;
 	}
 	onSubagentStart(subagentId) {
+		if (this.disposed) return;
 		if (subagentId) this.activeSubagentIds.add(subagentId);
 		else this.anonymousCount++;
 		if (!this.timer) this.startTimer();
 	}
 	onSubagentEnd(subagentId) {
+		if (this.disposed) return;
 		if (subagentId) this.activeSubagentIds.delete(subagentId);
 		else if (this.anonymousCount > 0) this.anonymousCount--;
 		if (this.activeSubagentIds.size === 0 && this.anonymousCount === 0) this.stopTimer();
 	}
 	startTimer() {
-		if (this.timer) return;
+		if (this.disposed || this.timer) return;
 		const cfg = this.deps.getConfig();
 		if (!cfg.heartbeatEnabled) return;
 		const interval = Math.max(3e4, cfg.heartbeatIntervalMs || 18e4);
@@ -27315,7 +27320,7 @@ var HeartbeatManager = class {
 		}
 	}
 	async triggerHeartbeat() {
-		if (this.inFlight) return;
+		if (this.disposed || this.inFlight) return;
 		this.inFlight = true;
 		try {
 			const cfg = this.deps.getConfig();
@@ -27325,15 +27330,19 @@ var HeartbeatManager = class {
 			}
 			const accounts = this.deps.pool ? this.deps.pool.getAccounts().filter((a) => a.enabled && !a.authRequired) : [];
 			if (accounts.length === 0) return;
-			const ping = this.deps.pingFn ?? loadCodeAssist;
+			const ping = this.deps.pingFn ?? ((t, p, c) => loadCodeAssist(t, p, c, true));
 			const customEndpoints = cfg.endpointCandidates;
+			let pingCount = 0;
 			const results = await Promise.allSettled(accounts.map(async (acc) => {
 				const token = await this.deps.quota.getValidAccessToken(acc);
 				if (!token) return;
+				pingCount++;
 				await ping(token, acc.proxyUrl, customEndpoints);
 			}));
-			this.lastPingAt = Date.now();
-			this.lastPingOk = !results.some((r) => r.status === "rejected");
+			if (pingCount > 0) {
+				this.lastPingAt = Date.now();
+				this.lastPingOk = !results.some((r) => r.status === "rejected");
+			}
 			for (const r of results) if (r.status === "rejected") this.deps.log?.(`heartbeat ping error: ${String(r.reason)}`);
 		} catch (err) {
 			this.lastPingAt = Date.now();
@@ -27344,6 +27353,7 @@ var HeartbeatManager = class {
 		}
 	}
 	dispose() {
+		this.disposed = true;
 		this.stopTimer();
 		this.activeSubagentIds.clear();
 		this.anonymousCount = 0;
