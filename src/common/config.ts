@@ -98,6 +98,11 @@ export function resolveConfig(
     autoFallbackModel: asBool(get('autoFallbackModel')) ?? base.autoFallbackModel,
     logRetentionDays: asNum(get('logRetentionDays')) ?? base.logRetentionDays,
     disableTelemetry: asBool(get('disableTelemetry')) ?? base.disableTelemetry,
+    heartbeatEnabled: asBool(get('heartbeatEnabled')) ?? base.heartbeatEnabled,
+    heartbeatIntervalMs: (() => {
+      const n = asNum(get('heartbeatIntervalMs'))
+      return n !== undefined ? Math.max(30_000, n) : base.heartbeatIntervalMs
+    })(),
 
     // Deprecated fields kept for backward compatibility
     agyBin: asString(get('agyBin')) ?? base.agyBin,
@@ -134,6 +139,13 @@ export function resolveConfig(
   if (env.DSH_AGY_QUOTA_POLL_INTERVAL_MS) {
     const n = asNum(env.DSH_AGY_QUOTA_POLL_INTERVAL_MS)
     if (n) cfg.quotaPollIntervalMs = Math.max(60_000, n)
+  }
+  if (env.DSH_AGY_HEARTBEAT_ENABLED !== undefined) {
+    cfg.heartbeatEnabled = asBool(env.DSH_AGY_HEARTBEAT_ENABLED) ?? cfg.heartbeatEnabled
+  }
+  if (env.DSH_AGY_HEARTBEAT_INTERVAL_MS) {
+    const n = asNum(env.DSH_AGY_HEARTBEAT_INTERVAL_MS)
+    if (n) cfg.heartbeatIntervalMs = Math.max(30_000, n)
   }
 
   return cfg

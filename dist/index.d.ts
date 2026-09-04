@@ -1,7 +1,19 @@
 import { Context } from "@deepseek-ai/cordis";
 //#region src/index.d.ts
+interface SubagentEvent {
+  id?: string;
+  session?: {
+    id?: string;
+  };
+}
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'subagent/start'(event?: SubagentEvent): void;
+    'subagent/end'(event?: SubagentEvent): void;
+  }
+}
 declare const name = "dsh-agy-link";
 declare const inject: string[];
 declare function apply(ctx: Context, entryConfig?: Record<string, unknown>): void;
 //#endregion
-export { apply, inject, name };
+export { SubagentEvent, apply, inject, name };

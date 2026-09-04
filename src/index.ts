@@ -16,7 +16,22 @@ import { ModelCatalog } from './host/models.ts'
 import { AccountPoolManager } from './host/pool.ts'
 import { PoolAuthFlow } from './host/pool-auth.ts'
 import { QuotaService } from './host/quota.ts'
+import { HeartbeatManager } from './host/heartbeat.ts'
 import type { ImageReader } from './host/message-converter.ts'
+
+export interface SubagentEvent {
+  id?: string
+  session?: {
+    id?: string
+  }
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'subagent/start'(event?: SubagentEvent): void
+    'subagent/end'(event?: SubagentEvent): void
+  }
+}
 
 export const name = 'dsh-agy-link'
 export const inject = ['llm', 'commands']
@@ -74,7 +89,18 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const getConfig = (): PluginConfig => resolveConfig(entryConfig)
   const pool = new AccountPoolManager()
   const quota = new QuotaService(pool)
+  const heartbeat = new HeartbeatManager({ getConfig, quota, pool, log })
   const semaphore = new Semaphore(() => getConfig().maxConcurrent)
+
+  ctx.on('subagent/start', (event) => {
+    const id = event?.id ?? event?.session?.id
+    heartbeat.onSubagentStart(id)
+  })
+  ctx.on('subagent/end', (event) => {
+    const id = event?.id ?? event?.session?.id
+    heartbeat.onSubagentEnd(id)
+  })
+  ctx.effect(() => () => heartbeat.dispose())
 
   const catalog = new ModelCatalog(
     async () => quota.discoverAvailableModels(),

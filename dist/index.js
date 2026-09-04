@@ -93,6 +93,8 @@ function defaultConfig() {
 		modelsCacheTtlMs: 3e5,
 		logRetentionDays: 7,
 		rateLimitPerMinute: 0,
+		heartbeatEnabled: true,
+		heartbeatIntervalMs: 18e4,
 		agyBin: "",
 		permissionMode: "skip",
 		workspaceRoot: "",
@@ -215,6 +217,11 @@ function resolveConfig(entry, env = process.env, overrides = readOverrides()) {
 		autoFallbackModel: asBool(get("autoFallbackModel")) ?? base.autoFallbackModel,
 		logRetentionDays: asNum(get("logRetentionDays")) ?? base.logRetentionDays,
 		disableTelemetry: asBool(get("disableTelemetry")) ?? base.disableTelemetry,
+		heartbeatEnabled: asBool(get("heartbeatEnabled")) ?? base.heartbeatEnabled,
+		heartbeatIntervalMs: (() => {
+			const n = asNum(get("heartbeatIntervalMs"));
+			return n !== void 0 ? Math.max(3e4, n) : base.heartbeatIntervalMs;
+		})(),
 		agyBin: asString$1(get("agyBin")) ?? base.agyBin,
 		permissionMode: asMode(get("permissionMode")) ?? base.permissionMode,
 		workspaceRoot: asString$1(get("workspaceRoot")) ?? base.workspaceRoot,
@@ -245,6 +252,11 @@ function resolveConfig(entry, env = process.env, overrides = readOverrides()) {
 	if (env.DSH_AGY_QUOTA_POLL_INTERVAL_MS) {
 		const n = asNum(env.DSH_AGY_QUOTA_POLL_INTERVAL_MS);
 		if (n) cfg.quotaPollIntervalMs = Math.max(6e4, n);
+	}
+	if (env.DSH_AGY_HEARTBEAT_ENABLED !== void 0) cfg.heartbeatEnabled = asBool(env.DSH_AGY_HEARTBEAT_ENABLED) ?? cfg.heartbeatEnabled;
+	if (env.DSH_AGY_HEARTBEAT_INTERVAL_MS) {
+		const n = asNum(env.DSH_AGY_HEARTBEAT_INTERVAL_MS);
+		if (n) cfg.heartbeatIntervalMs = Math.max(3e4, n);
 	}
 	return cfg;
 }
@@ -27265,6 +27277,87 @@ var QuotaService = class {
 	}
 };
 //#endregion
+//#region src/host/heartbeat.ts
+var HeartbeatManager = class {
+	deps;
+	activeSubagentIds = /* @__PURE__ */ new Set();
+	anonymousCount = 0;
+	timer = null;
+	inFlight = false;
+	lastPingAt;
+	lastPingOk;
+	constructor(deps) {
+		this.deps = deps;
+	}
+	onSubagentStart(subagentId) {
+		if (subagentId) this.activeSubagentIds.add(subagentId);
+		else this.anonymousCount++;
+		if (!this.timer) this.startTimer();
+	}
+	onSubagentEnd(subagentId) {
+		if (subagentId) this.activeSubagentIds.delete(subagentId);
+		else if (this.anonymousCount > 0) this.anonymousCount--;
+		if (this.activeSubagentIds.size === 0 && this.anonymousCount === 0) this.stopTimer();
+	}
+	startTimer() {
+		if (this.timer) return;
+		const cfg = this.deps.getConfig();
+		if (!cfg.heartbeatEnabled) return;
+		const interval = Math.max(3e4, cfg.heartbeatIntervalMs || 18e4);
+		this.timer = setInterval(() => {
+			this.triggerHeartbeat();
+		}, interval);
+	}
+	stopTimer() {
+		if (this.timer) {
+			clearInterval(this.timer);
+			this.timer = null;
+		}
+	}
+	async triggerHeartbeat() {
+		if (this.inFlight) return;
+		this.inFlight = true;
+		try {
+			const cfg = this.deps.getConfig();
+			if (!cfg.heartbeatEnabled) {
+				this.stopTimer();
+				return;
+			}
+			const accounts = this.deps.pool ? this.deps.pool.getAccounts().filter((a) => a.enabled && !a.authRequired) : [];
+			if (accounts.length === 0) return;
+			const ping = this.deps.pingFn ?? loadCodeAssist;
+			const customEndpoints = cfg.endpointCandidates;
+			const results = await Promise.allSettled(accounts.map(async (acc) => {
+				const token = await this.deps.quota.getValidAccessToken(acc);
+				if (!token) return;
+				await ping(token, acc.proxyUrl, customEndpoints);
+			}));
+			this.lastPingAt = Date.now();
+			this.lastPingOk = !results.some((r) => r.status === "rejected");
+			for (const r of results) if (r.status === "rejected") this.deps.log?.(`heartbeat ping error: ${String(r.reason)}`);
+		} catch (err) {
+			this.lastPingAt = Date.now();
+			this.lastPingOk = false;
+			this.deps.log?.(`heartbeat error: ${String(err)}`);
+		} finally {
+			this.inFlight = false;
+		}
+	}
+	dispose() {
+		this.stopTimer();
+		this.activeSubagentIds.clear();
+		this.anonymousCount = 0;
+	}
+	getStatus() {
+		return {
+			activeSubagents: this.activeSubagentIds.size + this.anonymousCount,
+			isRunning: this.timer !== null,
+			lastPingAt: this.lastPingAt,
+			lastPingOk: this.lastPingOk
+		};
+	}
+};
+//#endregion
 //#region src/index.ts
 const name = "dsh-agy-link";
 const inject = ["llm", "commands"];
@@ -27304,7 +27397,22 @@ function apply(ctx, entryConfig = {}) {
 	const getConfig = () => resolveConfig(entryConfig);
 	const pool = new AccountPoolManager();
 	const quota = new QuotaService(pool);
+	const heartbeat = new HeartbeatManager({
+		getConfig,
+		quota,
+		pool,
+		log
+	});
 	const semaphore = new Semaphore(() => getConfig().maxConcurrent);
+	ctx.on("subagent/start", (event) => {
+		const id = event?.id ?? event?.session?.id;
+		heartbeat.onSubagentStart(id);
+	});
+	ctx.on("subagent/end", (event) => {
+		const id = event?.id ?? event?.session?.id;
+		heartbeat.onSubagentEnd(id);
+	});
+	ctx.effect(() => () => heartbeat.dispose());
 	const catalog = new ModelCatalog(async () => quota.discoverAvailableModels(), getConfig().fallbackModels, getConfig().modelsCacheTtlMs);
 	catalog.refreshIfNeeded().catch(() => void 0);
 	const auth = new AuthHelper(pool, quota);

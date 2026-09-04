@@ -40,6 +40,10 @@ export interface PluginConfig {
   logRetentionDays: number
   /** Maximum requests allowed per minute across all sessions (0 = disabled). */
   rateLimitPerMinute: number
+  /** Send keepalive heartbeat pings during subagent execution to preserve CloudCode KV cache. */
+  heartbeatEnabled: boolean
+  /** Interval in ms between keepalive heartbeat pings (min: 30000, default: 180000). */
+  heartbeatIntervalMs: number
 
   // Deprecated configuration options (kept for backwards compatibility, silently ignored):
   /** @deprecated Use direct CloudCode API instead of agy binary */
@@ -109,6 +113,8 @@ export function defaultConfig(): PluginConfig {
     modelsCacheTtlMs: 300_000,
     logRetentionDays: 7,
     rateLimitPerMinute: 0,
+    heartbeatEnabled: true,
+    heartbeatIntervalMs: 180_000,
     agyBin: '',
     permissionMode: 'skip',
     workspaceRoot: '',
