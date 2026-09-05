@@ -124,3 +124,36 @@ test('numeric step_type map (14=thinking, 15=text, 5=tool)', () => {
   assert.equal(tool.stepKind, 'tool')
   assert.equal(tool.tool?.name, 'bash')
 })
+
+test('subagent payload extraction probes message, subagent_output, and description', () => {
+  const p = new StreamJsonParser()
+  const lines = [
+    '{"event":"step_update","idx":1,"step_type":"subagent","message":"subagent analyzing"}\n',
+    '{"event":"step_update","idx":2,"step_type":"subagent","subagent_output":"analysis completed"}\n',
+    '{"event":"step_update","idx":3,"step_type":"subagent_result","description":"task done"}\n',
+    '{"event":"step_update","idx":4,"step_type":"subagent","payload":{"message":"nested message"}}\n',
+    '{"event":"step_update","idx":5,"step_type":"subagent","subagent":{"description":"nested description"}}\n',
+  ].join('')
+  const evs = p.feed(lines)
+  assert.equal(asStep(evs[0]).stepKind, 'subagent')
+  assert.equal(asStep(evs[0]).text, 'subagent analyzing')
+  assert.equal(asStep(evs[1]).stepKind, 'subagent')
+  assert.equal(asStep(evs[1]).text, 'analysis completed')
+  assert.equal(asStep(evs[2]).stepKind, 'subagent')
+  assert.equal(asStep(evs[2]).text, 'task done')
+  assert.equal(asStep(evs[3]).text, 'nested message')
+  assert.equal(asStep(evs[4]).text, 'nested description')
+})
+
+test('tool step with description or subagent_output never hijacks step text', () => {
+  const p = new StreamJsonParser()
+  const lines = [
+    '{"event":"step_update","idx":1,"step_type":"tool","tool":{"name":"run_command","description":"executes a bash command"}}\n',
+    '{"event":"step_update","idx":2,"step_type":"tool","description":"tool description","subagent_output":"fake"}\n',
+  ].join('')
+  const evs = p.feed(lines)
+  assert.equal(asStep(evs[0]).stepKind, 'tool')
+  assert.equal(asStep(evs[0]).text, '')
+  assert.equal(asStep(evs[1]).stepKind, 'tool')
+  assert.equal(asStep(evs[1]).text, '')
+})

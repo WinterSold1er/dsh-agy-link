@@ -372,3 +372,39 @@ test('usageFromRaw maps snake_case fields', () => {
   assert.equal(u.cacheReadTokens, 4)
   assert.equal(u.cacheWriteTokens, 5)
 })
+
+test('subagent events: stream suffix delta, deduplicate snapshots, and preserve formatting', () => {
+  const m = newSpan()
+  // 1. Initial whitespace-only subagent step must not produce empty placeholder delta
+  const emptyChunks = mapAll(m, [
+    { kind: 'step', stepKey: 's1', stepKind: 'subagent', text: '   ' },
+  ])
+  const emptyDeltas = emptyChunks.filter((c) => c.type === 'reasoning-delta')
+  assert.equal(emptyDeltas.length, 0)
+
+  // 2. First non-empty snapshot produces delta prefixed with [agy subagent]
+  const nonEmptym = newSpan()
+  const stepEvents: Array<{ kind: 'step'; stepKey: string; stepKind: 'subagent'; text: string }> = [
+    { kind: 'step', stepKey: 's2', stepKind: 'subagent', text: 'worker task running' },
+  ]
+  const validChunks = mapAll(nonEmptym, stepEvents)
+  const validDeltas = validChunks.filter((c) => c.type === 'reasoning-delta') as Array<{ type: 'reasoning-delta'; text: string }>
+  assert.equal(validDeltas.length, 1)
+  assert.equal(validDeltas[0]?.text, '[agy subagent] worker task running')
+
+  // 3. Subsequent snapshot for same stepKey emits suffix delta only, without repeating prefix,
+  // and preserves markdown indentation and newlines.
+  const grownChunks = mapAll(nonEmptym, [
+    { kind: 'step', stepKey: 's2', stepKind: 'subagent', text: 'worker task running\n  - step 1: analyze\n  - step 2: execute' },
+  ])
+  const grownDeltas = grownChunks.filter((c) => c.type === 'reasoning-delta') as Array<{ type: 'reasoning-delta'; text: string }>
+  assert.equal(grownDeltas.length, 1)
+  assert.equal(grownDeltas[0]?.text, '\n  - step 1: analyze\n  - step 2: execute')
+
+  // 4. Repeated identical snapshot produces zero deltas (deduplicated)
+  const duplicateChunks = mapAll(nonEmptym, [
+    { kind: 'step', stepKey: 's2', stepKind: 'subagent', text: 'worker task running\n  - step 1: analyze\n  - step 2: execute' },
+  ])
+  const duplicateDeltas = duplicateChunks.filter((c) => c.type === 'reasoning-delta')
+  assert.equal(duplicateDeltas.length, 0)
+})

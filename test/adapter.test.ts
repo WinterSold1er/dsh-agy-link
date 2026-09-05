@@ -339,6 +339,59 @@ test('unknown reasoning effort on known model is rejected', async () => {
   )
 })
 
+test('reasoningEffort null disables effort without passing stringified null', async () => {
+  const { adapter, argsFile } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'ok'
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+  await collect(adapter.stream(opts([msg('user', 'x')], { model: 'gemini-3.7-flash', reasoningEffort: null as never })))
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  assert.equal(argv.includes('--effort'), false, 'effort flag must not be passed when reasoningEffort is null')
+})
+
+test('reasoningEffort case-insensitively normalizes values like High to high', async () => {
+  const { adapter, argsFile } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'ok'
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+  await collect(adapter.stream(opts([msg('user', 'x')], { model: 'gemini-3.7-flash', reasoningEffort: 'High' as never })))
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  assert.equal(argv[argv.indexOf('--effort') + 1], 'high')
+})
+
+test('non-thinking model with efforts null rejects explicit effort and omits effort flag', async () => {
+  const { adapter, argsFile } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'ok'
+  process.env.FAKE_AGY_ARGS_FILE = argsFile
+
+  // 1. Explicit effort on non-thinking model rejected
+  await assert.rejects(
+    () => collect(adapter.stream(opts([msg('user', 'x')], { model: 'gpt-oss-120b-medium', reasoningEffort: 'low' as never }))),
+    (e: unknown) => e instanceof LlmError && (e as LlmError & { code?: string }).code === Err.UNSUPPORTED_REASONING_EFFORT,
+  )
+
+  // 2. Default stream on non-thinking model omits --effort
+  await collect(adapter.stream(opts([msg('user', 'x')], { model: 'gpt-oss-120b-medium' })))
+  const argv = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  assert.equal(argv.includes('--effort'), false, 'non-thinking model must never pass --effort')
+})
+
+test('failed runs and continuation cleanup active status in RunRegistry', async () => {
+  const { adapter, runs } = makeAdapter()
+  process.env.FAKE_AGY_MODE = 'exit12'
+  const chunks = await collect(adapter.stream(opts([msg('user', 'hi')])))
+  const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string } }
+  assert.equal(finish.reason.kind, 'error')
+
+  // Run must not be active
+  assert.equal(runs.size > 0, true)
+  for (let i = 0; i < runs.size; i++) {
+    // Registry contains runs; none should be marked active
+    const r = (runs as unknown as { runs: Map<string, { isActive: boolean; runId: string }> }).runs
+    for (const rec of r.values()) {
+      assert.equal(runs.isActive(rec.runId), false, 'failed run must be marked inactive')
+    }
+  }
+})
+
 test('buildArgs assembles flags per ADR-3/8/10', () => {
   const { adapter } = makeAdapter()
   const args = adapter.buildArgs({
@@ -371,6 +424,17 @@ test('buildArgs assembles flags per ADR-3/8/10', () => {
   })
   assert.equal(claudeArgs[claudeArgs.indexOf('--model') + 1], 'claude-opus-4-6-thinking')
   assert.ok(!claudeArgs.includes('--effort'), 'effort flag stripped for non-gemini models')
+
+  // Never emit --effort "" when effort is empty or whitespace
+  const emptyEffortArgs = adapter.buildArgs({
+    prompt: 'hello',
+    model: 'gemini-3.8-flash',
+    effort: '   ',
+    permissionMode: 'skip',
+    timeoutMs: 60_000,
+    extraArgs: [],
+  })
+  assert.ok(!emptyEffortArgs.includes('--effort'), 'empty/whitespace effort must never produce --effort flag')
 })
 
 test('buildDigest bounds output and keeps newest turns', () => {

@@ -30,6 +30,7 @@ export class RunRecording {
   readonly runId: string
   private readonly events: AgyEvent[] = []
   private settled = false
+  private active = false
   private failure: RecordingFailure | null = null
   private resultConversationId: string | null = null
   private lastStepUsageRaw: RawUsage | null = null
@@ -89,6 +90,14 @@ export class RunRecording {
 
   get isSettled(): boolean {
     return this.settled
+  }
+
+  get isActive(): boolean {
+    return this.active || !this.settled
+  }
+
+  setActive(active: boolean): void {
+    this.active = active
   }
 
   /** Terminal failure, when the run ended without a consumable result. */
@@ -190,11 +199,21 @@ export function parseMirrorCallId(callId: string): { runId: string; eventIndex: 
   return { runId, eventIndex: n }
 }
 
-const MAX_RETAINED_RUNS = 8
+export const MAX_RETAINED_RUNS = 64
+export const DEFAULT_RUN_TTL_MS = 10 * 60 * 1000 // 10 minutes
 
 /** Bounded registry keeping the most recent runs for continuation spans. */
 export class RunRegistry {
+  private readonly maxRuns: number
+  private readonly ttlMs: number
   private readonly runs = new Map<string, RunRecording>()
+  private readonly lastAccess = new Map<string, number>()
+  private readonly activeSet = new Set<string>()
+
+  constructor(maxRuns: number = MAX_RETAINED_RUNS, ttlMs: number = DEFAULT_RUN_TTL_MS) {
+    this.maxRuns = maxRuns
+    this.ttlMs = ttlMs
+  }
 
   create(): RunRecording {
     const rec = new RunRecording()
@@ -202,21 +221,81 @@ export class RunRegistry {
     return rec
   }
 
-  remember(rec: RunRecording): void {
-    this.runs.set(rec.runId, rec)
-    while (this.runs.size > MAX_RETAINED_RUNS) {
-      const oldest = this.runs.keys().next().value
-      if (oldest === undefined) break
-      this.runs.delete(oldest)
+  sweepExpired(now: number = Date.now()): void {
+    for (const [id, ts] of this.lastAccess.entries()) {
+      const age = now - ts
+      // Inactive runs older than ttlMs, or any run older than 2 * ttlMs (hard safety ceiling)
+      if ((age > this.ttlMs && !this.isActive(id)) || age > this.ttlMs * 2) {
+        this.forget(id)
+      }
     }
   }
 
+  remember(rec: RunRecording): void {
+    this.sweepExpired()
+    this.runs.delete(rec.runId)
+    this.runs.set(rec.runId, rec)
+    this.lastAccess.set(rec.runId, Date.now())
+    this.evictIfNecessary()
+  }
+
   get(runId: string): RunRecording | undefined {
-    return this.runs.get(runId)
+    this.sweepExpired()
+    const rec = this.runs.get(runId)
+    if (rec !== undefined) {
+      // LRU refresh: move to most recent
+      this.runs.delete(runId)
+      this.runs.set(runId, rec)
+      this.lastAccess.set(runId, Date.now())
+    }
+    return rec
+  }
+
+  markActive(runId: string, active: boolean = true): void {
+    if (active) {
+      this.activeSet.add(runId)
+    } else {
+      this.activeSet.delete(runId)
+    }
+    const rec = this.runs.get(runId)
+    if (rec !== undefined) {
+      rec.setActive(active)
+    }
+  }
+
+  isActive(runId: string): boolean {
+    if (this.activeSet.has(runId)) return true
+    const rec = this.runs.get(runId)
+    return rec ? rec.isActive : false
   }
 
   /** Drop a settled run early (called when its final span finished stop). */
   forget(runId: string): void {
+    this.activeSet.delete(runId)
+    this.lastAccess.delete(runId)
     this.runs.delete(runId)
+  }
+
+  get size(): number {
+    return this.runs.size
+  }
+
+  private evictIfNecessary(): void {
+    while (this.runs.size > this.maxRuns) {
+      // Evict oldest inactive run first
+      let evictId: string | undefined
+      for (const id of this.runs.keys()) {
+        if (!this.isActive(id)) {
+          evictId = id
+          break
+        }
+      }
+      // If all are active, fall back to evicting oldest to honor bounded memory
+      if (evictId === undefined) {
+        evictId = this.runs.keys().next().value
+      }
+      if (evictId === undefined) break
+      this.forget(evictId)
+    }
   }
 }

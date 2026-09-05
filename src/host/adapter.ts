@@ -278,8 +278,9 @@ export class AgyAdapter extends LlmAdapter {
     else args.push('--mode', opts.permissionMode)
     const effectiveModel = resolveModelSlug(opts.model)
     if (effectiveModel !== '') args.push('--model', effectiveModel)
-    const isGemini = effectiveModel === '' || effectiveModel.toLowerCase().startsWith('gemini')
-    if (isGemini && opts.effort && opts.effort !== '') args.push('--effort', opts.effort)
+    const isGemini = effectiveModel !== '' && effectiveModel.toLowerCase().startsWith('gemini')
+    const trimmedEffort = typeof opts.effort === 'string' ? opts.effort.trim() : ''
+    if (isGemini && trimmedEffort !== '') args.push('--effort', trimmedEffort)
     if (opts.conversationId) args.push('--conversation', opts.conversationId)
     for (const d of opts.addDirs ?? []) args.push('--add-dir', d)
     args.push(...opts.extraArgs)
@@ -339,7 +340,20 @@ export class AgyAdapter extends LlmAdapter {
         }
         return
       }
-      yield* this.driveSpan(rec, continuation.eventIndex + 1, true, isCodeMode)
+      this.deps.runs.markActive(rec.runId, true)
+      let isWaitingForNextTool = false
+      try {
+        for await (const ch of this.driveSpan(rec, continuation.eventIndex + 1, true, isCodeMode)) {
+          if (ch.type === 'finish' && ch.reason.kind === 'tool-calls') {
+            isWaitingForNextTool = true
+          }
+          yield ch
+        }
+      } finally {
+        if (!isWaitingForNextTool) {
+          this.deps.runs.markActive(rec.runId, false)
+        }
+      }
       return
     }
     // Mid-turn steer preemption: DSH claims the steered message at the next
@@ -354,26 +368,66 @@ export class AgyAdapter extends LlmAdapter {
     const catalog = this.deps.catalog.get()
     const rawModel = options.model
     const model = resolveModelSlug(rawModel)
-    const entry = findEntry(catalog, model)
-    const isGemini = (model === '' ? cfg.defaultModel : model).toLowerCase().startsWith('gemini')
-    // The catalog is advisory (the fallback list may be stale): accept unknown
-    // ids, but validate explicit reasoning efforts against known entries.
-    let effort: string | undefined
-    if (isGemini) {
-      if (isAux) {
-        effort = 'low'
-      } else if (options.reasoningEffort !== undefined) {
-        const wanted = String(options.reasoningEffort)
-        if (entry && entry.efforts === null) {
-          throw new LlmError('model ' + model + ' has no selectable reasoning efforts', Err.UNSUPPORTED_REASONING_EFFORT)
-        }
-        if (entry && entry.efforts && !entry.efforts.includes(wanted)) {
-          throw new LlmError('reasoning effort ' + wanted + ' is not supported by ' + model, Err.UNSUPPORTED_REASONING_EFFORT)
-        }
-        effort = wanted
-      } else if (entry && entry.efforts) {
-        effort = defaultEffortFor(entry, cfg)
+    const effectiveModel = model !== '' ? model : (cfg.defaultModel ? resolveModelSlug(cfg.defaultModel) : '')
+    const entry = findEntry(catalog, effectiveModel !== '' ? effectiveModel : model)
+    const isGemini = effectiveModel !== '' && effectiveModel.toLowerCase().startsWith('gemini')
+
+    // Defensive normalization of options.reasoningEffort:
+    // null -> explicitly disabled reasoning (do not stringify to "null")
+    // undefined -> unprovided
+    // string -> trim and lowercase
+    let wantedEffort: string | undefined
+    if (options.reasoningEffort !== undefined && options.reasoningEffort !== null) {
+      const trimmed = String(options.reasoningEffort).trim().toLowerCase()
+      if (trimmed !== '' && trimmed !== 'null' && trimmed !== 'undefined' && trimmed !== 'none') {
+        wantedEffort = trimmed
       }
+    }
+
+    let effort: string | undefined
+    if (entry && entry.efforts === null) {
+      if (wantedEffort !== undefined) {
+        throw new LlmError('model ' + (model || effectiveModel) + ' has no selectable reasoning efforts', Err.UNSUPPORTED_REASONING_EFFORT)
+      }
+      effort = undefined
+    } else if (entry && entry.efforts && entry.efforts.length > 0) {
+      if (wantedEffort !== undefined) {
+        const matched = entry.efforts.find((e) => e.toLowerCase() === wantedEffort)
+        if (!matched) {
+          throw new LlmError('reasoning effort ' + wantedEffort + ' is not supported by ' + (model || effectiveModel), Err.UNSUPPORTED_REASONING_EFFORT)
+        }
+        effort = matched
+      } else if (options.reasoningEffort === null) {
+        // null explicitly disables reasoning
+        effort = undefined
+      } else if (isAux) {
+        effort = entry.efforts.includes('low') ? 'low' : entry.efforts[0]
+      } else {
+        effort = defaultEffortFor(entry, cfg) ?? (entry.efforts.includes('high') ? 'high' : entry.efforts[0])
+      }
+    } else if (!entry) {
+      // Unrecognized model in catalog
+      if (wantedEffort !== undefined) {
+        if (isGemini) {
+          effort = wantedEffort
+        } else {
+          effort = undefined
+        }
+      } else if (options.reasoningEffort === null) {
+        effort = undefined
+      } else if (isGemini) {
+        if (isAux) {
+          effort = 'low'
+        } else if (cfg.defaultEffort && cfg.defaultEffort.trim() !== '') {
+          effort = cfg.defaultEffort.trim().toLowerCase()
+        } else {
+          effort = undefined
+        }
+      } else {
+        effort = undefined
+      }
+    } else {
+      effort = undefined
     }
 
     // ---- prompt assembly (ADR-7) ----
@@ -541,6 +595,7 @@ export class AgyAdapter extends LlmAdapter {
     // ---- spawn + record (v0.3: spans consume a shared recording) ----
     const before = snapshotConversations()
     const rec = this.deps.runs.create()
+    this.deps.runs.markActive(rec.runId, true)
     const parser = new StreamJsonParser()
     this.deps.onParser?.(parser)
     let streamCid: string | null = null
@@ -675,6 +730,22 @@ export class AgyAdapter extends LlmAdapter {
         }
       }
       rec.settle(failure)
+      if (failure !== null) {
+        this.deps.runs.markActive(rec.runId, false)
+      } else {
+        // If settled without failure, check if any completed tool step exists in rec
+        let hasTool = false
+        for (let i = 0; i < rec.length; i++) {
+          const ev = rec.eventAt(i)
+          if (ev?.kind === 'step' && ev.stepKind === 'tool' && ev.tool && (ev.tool.output !== undefined || ev.tool.error !== undefined)) {
+            hasTool = true
+            break
+          }
+        }
+        if (!hasTool) {
+          this.deps.runs.markActive(rec.runId, false)
+        }
+      }
       if (failure === null) {
         if (account) this.deps.pool?.recordSuccess(account.id, family)
         if (!isAux && sessionAccountKey !== '') {
@@ -719,11 +790,24 @@ export class AgyAdapter extends LlmAdapter {
     })().catch((err) => {
       releaseOnce()
       rec.settle({ kind: 'error', code: Err.PROCESS_EXIT, message: 'internal error: ' + brief(String(err)) })
+      this.deps.runs.markActive(rec.runId, false)
     })
 
     // First span of the run: stream recorded events until the first
     // completed tool step cuts it (or the result finishes it).
-    yield* this.driveSpan(rec, 0, !isAux, isCodeMode)
+    let isWaitingForTool = false
+    try {
+      for await (const ch of this.driveSpan(rec, 0, !isAux, isCodeMode)) {
+        if (ch.type === 'finish' && ch.reason.kind === 'tool-calls') {
+          isWaitingForTool = true
+        }
+        yield ch
+      }
+    } finally {
+      if (!isWaitingForTool) {
+        this.deps.runs.markActive(rec.runId, false)
+      }
+    }
   }
 
   /**

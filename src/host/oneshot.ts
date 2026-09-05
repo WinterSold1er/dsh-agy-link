@@ -106,7 +106,7 @@ export async function runAgyOnce(
   if (mode === 'skip') args.push('--dangerously-skip-permissions')
   else args.push('--mode', mode)
   if (req.model) args.push('--model', req.model)
-  if (req.effort) args.push('--effort', req.effort)
+  if (req.effort && req.effort.trim() !== '') args.push('--effort', req.effort.trim())
   let prompt = req.prompt
   if (req.readPaths && req.readPaths.length > 0) {
     prompt = await inlineFiles(prompt, req.readPaths, cfg.workspaceRoot !== '' ? cfg.workspaceRoot : process.cwd())

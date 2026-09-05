@@ -56,13 +56,42 @@ function normalizeStepKind(v: unknown): AgyStepKind {
   return 'unknown'
 }
 
-function extractText(obj: Record<string, unknown>): string {
-  const direct = pick(obj, ['text', 'content', 'agent_text', 'agentText', 'output_text', 'payload_text'])
+const STANDARD_TEXT_KEYS = [
+  'text',
+  'content',
+  'agent_text',
+  'agentText',
+  'output_text',
+  'payload_text',
+  'message',
+] as const
+
+const SUBAGENT_TEXT_KEYS = [
+  ...STANDARD_TEXT_KEYS,
+  'subagent_output',
+  'subagentOutput',
+  'description',
+] as const
+
+function extractText(obj: Record<string, unknown>, stepKind?: AgyStepKind): string {
+  const candidateKeys = stepKind === 'subagent' ? SUBAGENT_TEXT_KEYS : STANDARD_TEXT_KEYS
+  const direct = pick(obj, candidateKeys)
   if (typeof direct === 'string') return direct
-  const payload = obj.payload ?? obj.step_payload ?? obj.stepPayload
-  if (payload && typeof payload === 'object') {
-    const inner = pick(payload as Record<string, unknown>, ['text', 'content', 'agent_text', 'agentText'])
+  if (direct && typeof direct === 'object' && !Array.isArray(direct)) {
+    const inner = pick(direct as Record<string, unknown>, candidateKeys)
     if (typeof inner === 'string') return inner
+  }
+  const payload =
+    stepKind === 'subagent'
+      ? (obj.payload ?? obj.step_payload ?? obj.stepPayload ?? obj.subagent)
+      : (obj.payload ?? obj.step_payload ?? obj.stepPayload)
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const inner = pick(payload as Record<string, unknown>, candidateKeys)
+    if (typeof inner === 'string') return inner
+    if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+      const nested = pick(inner as Record<string, unknown>, candidateKeys)
+      if (typeof nested === 'string') return nested
+    }
   }
   return ''
 }
@@ -154,7 +183,7 @@ export function classifyEvent(obj: unknown, seq: number): AgyEvent | undefined {
     const stepKind = normalizeStepKind(pick(src, ['step_type', 'stepType', 'type']))
     const toolInfo = stepKind === 'tool' ? extractTool(src) : undefined
     const delta = extractTextDelta(src)
-    const text = delta !== undefined ? delta : extractText(src)
+    const text = delta !== undefined ? delta : extractText(src, stepKind)
     const stateV = pick(src, ['state'])
     const usageRaw = pick(src, ['usage'])
     return {

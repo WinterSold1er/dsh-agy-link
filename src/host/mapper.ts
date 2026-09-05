@@ -77,6 +77,7 @@ export class EventMapper {
   private readonly emittedByKey = new Map<string, string>()
   private readonly announcedTools = new Set<string>()
   private readonly thinkingAnnounced = new Set<string>()
+  private readonly subagentAnnounced = new Set<string>()
   private sawTextStep: boolean
   private finished = false
 
@@ -200,8 +201,27 @@ export class EventMapper {
           const d = this.appendDelta(delta)
           if (d) yield d
         } else {
-          const d = this.appendDelta('[agy subagent] ' + ev.text + '\n')
-          if (d) yield d
+          let delta: string
+          if (ev.fragment === true) {
+            const acc = (this.emittedByKey.get(ev.stepKey) ?? '') + ev.text
+            this.emittedByKey.set(ev.stepKey, acc)
+            delta = ev.text
+          } else {
+            const prev = this.emittedByKey.get(ev.stepKey) ?? ''
+            delta = suffixDelta(prev, ev.text)
+            this.emittedByKey.set(ev.stepKey, ev.text)
+          }
+          if (delta === '') return
+
+          if (!this.subagentAnnounced.has(ev.stepKey)) {
+            if (delta.trim() === '') return
+            this.subagentAnnounced.add(ev.stepKey)
+            const d = this.appendDelta('[agy subagent] ' + delta)
+            if (d) yield d
+          } else {
+            const d = this.appendDelta(delta)
+            if (d) yield d
+          }
         }
         return
       }

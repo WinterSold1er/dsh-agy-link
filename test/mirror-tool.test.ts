@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { RunRecording, RunRegistry } from '../src/host/recording.ts'
+import { MAX_RETAINED_RUNS, RunRecording, RunRegistry } from '../src/host/recording.ts'
 import { defineAgyMirrorTool, presentMirrorCall, buildMirrorRunCode, parseMirrorInvocation } from '../src/host/mirror-tool.ts'
 
 function fakeSignal(): AbortSignal {
@@ -34,10 +34,55 @@ test('recording: result event projection and tool lookup by index', () => {
 
 test('registry retains bounded LRU and serves runs by id', () => {
   const reg = new RunRegistry()
+  assert.equal(MAX_RETAINED_RUNS, 64)
   const a = reg.create()
   assert.equal(reg.get(a.runId), a)
   reg.forget(a.runId)
   assert.equal(reg.get(a.runId), undefined)
+})
+
+test('registry protects active runs from LRU eviction and refreshes LRU order', () => {
+  const reg = new RunRegistry(3)
+  const r1 = reg.create()
+  const r2 = reg.create()
+  const r3 = reg.create()
+
+  // Mark r1 as active, r2 and r3 settled
+  r1.setActive(true)
+  r2.settle(null)
+  r3.settle(null)
+
+  // Access r2 to make it more recently used than r3
+  reg.get(r2.runId)
+
+  // Create r4, causing eviction.
+  // r1 is active, so it should NOT be evicted.
+  // Between r2 and r3, r3 was least recently used, so r3 should be evicted!
+  const r4 = reg.create()
+  assert.equal(reg.get(r1.runId) !== undefined, true, 'active r1 must be preserved')
+  assert.equal(reg.get(r2.runId) !== undefined, true, 'recently accessed r2 must be preserved')
+  assert.equal(reg.get(r3.runId), undefined, 'oldest inactive r3 must be evicted')
+  assert.equal(reg.get(r4.runId) !== undefined, true, 'newly created r4 must exist')
+})
+
+test('registry sweeps expired runs based on TTL', () => {
+  const reg = new RunRegistry(10, 50)
+  const r1 = reg.create()
+  const r2 = reg.create()
+  r1.settle(null)
+  r2.setActive(true)
+
+  assert.equal(reg.get(r1.runId) !== undefined, true)
+  assert.equal(reg.get(r2.runId) !== undefined, true)
+
+  // At +60ms (> 50ms TTL): inactive r1 evicted, active r2 preserved
+  reg.sweepExpired(Date.now() + 60)
+  assert.equal(reg.get(r1.runId), undefined, 'inactive expired run r1 must be evicted')
+  assert.equal(reg.get(r2.runId) !== undefined, true, 'active run r2 protected within hard TTL limit')
+
+  // At +120ms (> 2*TTL): active r2 evicted by hard safety ceiling
+  reg.sweepExpired(Date.now() + 120)
+  assert.equal(reg.get(r2.runId), undefined, 'active run exceeding 2*TTL hard ceiling must be evicted')
 })
 
 test('mirror execute replays recorded output and errors honestly', async () => {

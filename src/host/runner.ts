@@ -175,27 +175,118 @@ export interface RunningProcess {
   kill(reason: 'timeout' | 'abort'): void;
 }
 
-const GRACE_MS = 5000;
+export const GRACE_MS = 800;
 
-function killTree(child: ChildProcess): void {
-  if (child.pid === undefined) return;
-  if (IS_WIN) {
-    // No Unix process groups on Windows: kill the whole tree via taskkill.
+/** Check whether a process (or on Unix its process group) is still running. */
+export function isProcessAlive(pid: number): boolean {
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 1) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: unknown) {
+    // EPERM means the PID exists but belongs to another user/system process (PID reuse defense).
+    // ESRCH means process does not exist.
+  }
+  if (!IS_WIN) {
     try {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+      process.kill(-pid, 0);
+      return true;
     } catch {
-      try { child.kill() } catch { /* already gone */ }
+      // EPERM or ESRCH -> not our process group
+    }
+  }
+  return false;
+}
+
+export function killTree(child: ChildProcess, graceMs: number = GRACE_MS): void {
+  const pid = child.pid;
+  if (pid === undefined || pid <= 1) return;
+  if (IS_WIN) {
+    // Windows: taskkill /F /T /PID kills the entire process tree.
+    try {
+      spawn('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true });
+    } catch {
+      try { child.kill(); } catch { /* already gone */ }
     }
     return;
   }
+
+  // Entrance guard: if the main process already exited and the process group is gone, return immediately.
+  const isExited = child.exitCode !== null || child.signalCode !== null || child.killed;
+  if (isExited && !isProcessAlive(pid)) {
+    return;
+  }
+
+  // Phase 1: Send SIGTERM to the process group (-pid).
   try {
-    process.kill(-child.pid, 'SIGTERM');
+    process.kill(-pid, 'SIGTERM');
   } catch {
-    try {
-      child.kill('SIGTERM');
-    } catch {
-      // already gone'
+    if (child.exitCode === null && !child.killed) {
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // already gone
+      }
     }
+  }
+
+  // If already gone immediately after SIGTERM, do not mount any timers.
+  if (!isProcessAlive(pid)) {
+    return;
+  }
+
+  let cleanedUp = false;
+  let pollTimer: NodeJS.Timeout | null = null;
+  let graceTimer: NodeJS.Timeout | null = null;
+
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (graceTimer) {
+      clearTimeout(graceTimer);
+      graceTimer = null;
+    }
+  };
+
+  child.once('exit', () => {
+    if (!isProcessAlive(pid)) {
+      cleanup();
+    }
+  });
+
+  // Short grace period with fast polling detection (every 50ms).
+  pollTimer = setInterval(() => {
+    if (!isProcessAlive(pid)) {
+      cleanup();
+    }
+  }, 50);
+  if (typeof pollTimer.unref === 'function') {
+    pollTimer.unref();
+  }
+
+  // Phase 2: After graceMs, send SIGKILL strictly to the negative process group (-pid).
+  // Never send individual SIGKILL to child.pid to avoid killing reused system PIDs.
+  graceTimer = setTimeout(() => {
+    if (isProcessAlive(pid)) {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch {
+        // already gone
+      }
+    }
+    setTimeout(() => {
+      cleanup();
+    }, 50).unref?.();
+  }, graceMs);
+
+  if (typeof graceTimer.unref === 'function') {
+    graceTimer.unref();
   }
 }
 
@@ -251,7 +342,11 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
     aborted = true;
     killTree(child);
   };
-  opts.signal?.addEventListener('abort', onAbort, { once: true });
+  if (opts.signal?.aborted) {
+    onAbort();
+  } else {
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+  }
 
   if (child.stdout) child.stdout.setEncoding('utf8');
   if (child.stderr) child.stderr.setEncoding('utf8');

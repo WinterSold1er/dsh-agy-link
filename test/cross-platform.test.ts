@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { binCandidates, isolatedHomeEnv, isCmdShim, resolveAgyBin, startAgyProcess, windowsQuote } from '../src/host/runner.ts'
+import { binCandidates, isolatedHomeEnv, isCmdShim, isProcessAlive, killTree, resolveAgyBin, startAgyProcess, windowsQuote } from '../src/host/runner.ts'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
@@ -118,4 +118,77 @@ test('resolveAgyBin honors explicit agyBin config if it exists', () => {
   const missing = resolveAgyBin({ agyBin: '/nonexistent/agy/path/xyz' } as never)
   // If explicit path does not exist, it falls back to scanning or null
   assert.notEqual(missing, '/nonexistent/agy/path/xyz')
+})
+
+test('startAgyProcess aborts immediately when signal is pre-aborted', async () => {
+  const ac = new AbortController()
+  ac.abort()
+  const proc = startAgyProcess({
+    bin: process.execPath,
+    args: ['-e', 'setTimeout(() => {}, 5000)'],
+    signal: ac.signal,
+  })
+  const outcome = await proc.outcome
+  assert.equal(outcome.aborted, true)
+})
+
+test('killTree reaps stubborn processes with stage-2 SIGKILL', async () => {
+  if (process.platform === 'win32') return
+  // Child ignores SIGTERM
+  const script = `
+    process.on('SIGTERM', () => {});
+    setInterval(() => {}, 1000);
+  `
+  const proc = startAgyProcess({
+    bin: process.execPath,
+    args: ['-e', script],
+  })
+  // Give process a moment to spin up
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(isProcessAlive(proc.child.pid!), true)
+
+  // Kill with short grace period (150ms)
+  killTree(proc.child, 150)
+  const outcome = await proc.outcome
+  assert.equal(outcome.signal, 'SIGKILL')
+  assert.equal(isProcessAlive(proc.child.pid!), false)
+})
+
+test('isProcessAlive defensively rejects invalid PIDs and EPERM errors', () => {
+  // PIDs <= 1 must always be treated as not alive
+  assert.equal(isProcessAlive(0), false)
+  assert.equal(isProcessAlive(1), false)
+  assert.equal(isProcessAlive(-1), false)
+  assert.equal(isProcessAlive(NaN), false)
+
+  // Test EPERM simulation: PID belonging to another user must return false
+  const origKill = process.kill
+  try {
+    process.kill = ((_pid: number, _sig?: string | number) => {
+      const err = new Error('operation not permitted') as NodeJS.ErrnoException
+      err.code = 'EPERM'
+      throw err
+    }) as typeof process.kill
+
+    assert.equal(isProcessAlive(99999), false, 'EPERM must be treated as false to prevent PID reuse misuse')
+  } finally {
+    process.kill = origKill
+  }
+})
+
+test('killTree exits immediately for already exited child without hanging', async () => {
+  const proc = startAgyProcess({
+    bin: process.execPath,
+    args: ['-e', 'process.exit(0)'],
+  })
+  await proc.outcome
+  // Child has already exited
+  assert.equal(proc.child.exitCode !== null, true)
+  assert.equal(isProcessAlive(proc.child.pid!), false)
+
+  // killTree should return immediately without scheduling timers
+  const start = Date.now()
+  killTree(proc.child, 1000)
+  const elapsed = Date.now() - start
+  assert.ok(elapsed < 100, `killTree took ${elapsed}ms, should return immediately for dead process`)
 })
