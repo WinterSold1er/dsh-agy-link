@@ -102,7 +102,7 @@ export function defaultConfig(): PluginConfig {
     mediaTtlMs: 86_400_000,
     mediaMaxBytes: 10 * 1024 * 1024,
     mediaMaxImages: 8,
-    mcpBridge: false,
+    mcpBridge: true,
     mcpToolAllowlist: '',
     rateLimitPerMinute: 0,
     autoFallbackModel: false,

@@ -5,10 +5,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply } from '../src/index.ts'
+import { apply, resolveBridgeScript } from '../src/index.ts'
 
 // Hermetic sandbox: own DSH_HOME + a stub agy binary so the guard runs on
 // CI machines without agy installed.
@@ -74,5 +74,13 @@ test('agy_tool registers when the tools service appears after plugin load', asyn
   // Teardown disposes the registration.
   await ctx.fiber.dispose()
   assert.ok(disposed.includes('agy_tool'), 'agy_tool disposed on teardown')
+
+  // Verify bridge.mjs dual-path resolution (P1)
+  const resolved = resolveBridgeScript()
+  assert.ok(resolved.endsWith('bridge.mjs'), 'bridge script must resolve to bridge.mjs')
+  assert.ok(existsSync(resolved), 'resolved bridge script must exist on disk')
+
   rmSync(workDir, { recursive: true, force: true })
+  delete process.env.DSH_HOME
+  delete process.env.DSH_AGY_BIN
 })

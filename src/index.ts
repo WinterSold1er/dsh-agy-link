@@ -18,14 +18,16 @@ import { writeDoctorReport } from './host/diagnostics.ts'
 import { defineAgyMirrorTool } from './host/mirror-tool.ts'
 import { ModelCatalog } from './host/models.ts'
 import { RunRegistry } from './host/recording.ts'
-import { MIN_AGY_VERSION, compareVersions, isolatedHomeEnv, parseVersion, probeProcess, resolveAgyBin } from './host/runner.ts'
+import { MIN_AGY_VERSION, compareVersions, isolatedHomeEnv, parseVersion, probeProcess, resolveAgyBin, AgyProcessSupervisor } from './host/runner.ts'
 import { SessionStore } from './host/sessions.ts'
 import { AccountPoolManager } from './host/pool.ts'
 import { PoolAuthFlow } from './host/pool-auth.ts'
 import { QuotaService } from './host/quota.ts'
 import { StreamJsonParser } from './host/parser.ts'
 import { defaultMediaDir, sweepDir, type ImageRefLike } from './host/media.ts'
-import { startMcpBridge, writeMcpConfig, type McpBridge, type ToolsServiceLike } from './host/mcp-bridge.ts'
+import { startMcpBridge, writeMcpConfig, shadowMergeGeminiMcpConfig, cleanOrphanMcpConfigs, type McpBridge, type ToolsServiceLike } from './host/mcp-bridge.ts'
+import { scanAndStageSkills } from './host/skills-bridge.ts'
+import { SubagentBridge, type SubagentEventEmitter } from './host/subagent-bridge.ts'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-agy-link'
@@ -67,6 +69,34 @@ class Semaphore {
     const next = this.queue.shift()
     if (next) next()
   }
+}
+
+export function resolveBridgeScript(base: string = import.meta.url): string {
+  // Probing priority: dist/bridge.mjs first (production bundle or built artifact),
+  // then fallback to src/host/bridge.mjs (tsx source / development mode).
+  const distCandidates = [
+    new URL('./bridge.mjs', base),
+    new URL('../dist/bridge.mjs', base),
+  ]
+  for (const candidate of distCandidates) {
+    const p = fileURLToPath(candidate)
+    if (p.endsWith(join('dist', 'bridge.mjs')) && existsSync(p)) {
+      return p
+    }
+  }
+
+  const srcCandidates = [
+    new URL('./host/bridge.mjs', base),
+    new URL('../src/host/bridge.mjs', base),
+  ]
+  for (const candidate of srcCandidates) {
+    const p = fileURLToPath(candidate)
+    if (existsSync(p)) {
+      return p
+    }
+  }
+
+  return fileURLToPath(new URL('./bridge.mjs', base))
 }
 
 export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): void {
@@ -156,12 +186,17 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const auth = new AuthHelper(bin)
   const poolAuth = new PoolAuthFlow(pool, quota, log)
   const runs = new RunRegistry()
+  const supervisor = new AgyProcessSupervisor(log)
+  const subagentBridge = new SubagentBridge(ctx as unknown as SubagentEventEmitter, log)
+  const stagedSkills = scanAndStageSkills({ log })
 
   // Boot hygiene: remove staging dirs and purge old historical logs
   const swept = pool.sweepStaleStaging()
   if (swept > 0) log('swept ' + swept + ' stale staging dir(s)')
   const logsSwept = pool.sweepOldLogs(getConfig().logRetentionDays)
   if (logsSwept > 0) log('swept ' + logsSwept + ' old log file(s)')
+  const cleanedMcp = cleanOrphanMcpConfigs({ dshHomeDir: dshHome(), log })
+  if (cleanedMcp > 0) log('boot hygiene: cleaned ' + cleanedMcp + ' orphaned dsh_managed MCP config(s)')
 
   const adapter = new AgyAdapter({
     getConfig,
@@ -172,6 +207,9 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
     acquire: () => semaphore.acquire(),
     log,
     runs,
+    supervisor,
+    subagentBridge,
+    skillsStagingDir: () => stagedSkills.stagingDir,
     sessionCwd: (sessionId) => {
       const sessions = ctx.get('sessions') as { get(id: unknown): { header?: { cwd?: string } } | undefined } | undefined
       return sessions?.get(sessionId)?.header?.cwd
@@ -720,6 +758,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   })
 
   const bridgeState: { bridge: Awaited<ReturnType<typeof startMcpBridge>> | null; restore: (() => void) | null } = { bridge: null, restore: null }
+  let disposed = false
   const syncMcpBridge = (): void => {
     const cfg = getConfig()
     const want = cfg.mcpBridge && cfg.enabled
@@ -728,7 +767,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         try {
           // fileURLToPath resolves file:/// URLs correctly on Windows
           // (URL.pathname would yield /C:/... there and break the spawn).
-          const script = fileURLToPath(new URL('./bridge.mjs', import.meta.url))
+          const script = resolveBridgeScript()
           const toolsSvc = ctx.get('tools') as ToolsServiceLike | undefined
           const bridge = await startMcpBridge({
             bridgeScript: script,
@@ -736,9 +775,29 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
             allowlist: () => getConfig().mcpToolAllowlist,
             log,
           })
+          if (disposed) {
+            void bridge.close()
+            return
+          }
           bridgeState.bridge = bridge
           const root = cfg.workspaceRoot !== '' ? cfg.workspaceRoot : process.cwd()
-          bridgeState.restore = writeMcpConfig(root, bridge)
+          const restoreWorkspace = writeMcpConfig(root, bridge)
+          const restoreGemini = shadowMergeGeminiMcpConfig({
+            bridge,
+            dshHomeDir: dshHome(),
+            log,
+          })
+          bridgeState.restore = () => {
+            restoreWorkspace()
+            restoreGemini()
+          }
+          if (disposed) {
+            bridgeState.restore()
+            void bridge.close()
+            bridgeState.bridge = null
+            bridgeState.restore = null
+            return
+          }
           log('mcp bridge ready at ' + bridge.url + (toolsSvc ? '' : ' (tools service not yet available)'))
         } catch (e) {
           log('mcp bridge failed to start: ' + String(e))
@@ -754,12 +813,18 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   syncMcpBridge()
 
   ctx.effect(() => {
-    auth.dispose()
-    void poolAuth.cancel()
-    if (askToolDispose.current !== null) askToolDispose.current()
-    if (mirrorToolDispose.current !== null) mirrorToolDispose.current()
-    bridgeState.restore?.()
-    void bridgeState.bridge?.close()
-    return () => undefined
+    return () => {
+      disposed = true
+      auth.dispose()
+      void poolAuth.cancel()
+      void supervisor.dispose()
+      subagentBridge.dispose()
+      if (askToolDispose.current !== null) askToolDispose.current()
+      if (mirrorToolDispose.current !== null) mirrorToolDispose.current()
+      bridgeState.restore?.()
+      void bridgeState.bridge?.close()
+      bridgeState.bridge = null
+      bridgeState.restore = null
+    }
   })
 }

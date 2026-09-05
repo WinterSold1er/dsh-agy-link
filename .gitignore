@@ -9,3 +9,7 @@ research/
 
 # agy credential dirs (never commit)
 .gemini/
+
+# MCP bridge workspace config (ephemeral, never commit)
+.mcp.json
+

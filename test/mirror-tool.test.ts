@@ -66,7 +66,7 @@ test('registry protects active runs from LRU eviction and refreshes LRU order', 
 })
 
 test('registry sweeps expired runs based on TTL', () => {
-  const reg = new RunRegistry(10, 50)
+  const reg = new RunRegistry(10, 50, 100)
   const r1 = reg.create()
   const r2 = reg.create()
   r1.settle(null)
@@ -80,9 +80,28 @@ test('registry sweeps expired runs based on TTL', () => {
   assert.equal(reg.get(r1.runId), undefined, 'inactive expired run r1 must be evicted')
   assert.equal(reg.get(r2.runId) !== undefined, true, 'active run r2 protected within hard TTL limit')
 
-  // At +120ms (> 2*TTL): active r2 evicted by hard safety ceiling
+  // At +120ms (> 100ms hard ceiling): active r2 evicted by hard safety ceiling
   reg.sweepExpired(Date.now() + 120)
-  assert.equal(reg.get(r2.runId), undefined, 'active run exceeding 2*TTL hard ceiling must be evicted')
+  assert.equal(reg.get(r2.runId), undefined, 'active run exceeding hard ceiling must be evicted')
+})
+
+test('registry evicts oldest active run when capacity exceeds maxRuns * 1.5', () => {
+  const reg = new RunRegistry(2) // maxRuns = 2, hardMaxCapacity = ceil(2 * 1.5) = 3
+  const r1 = reg.create()
+  const r2 = reg.create()
+  r1.setActive(true)
+  r2.setActive(true)
+
+  // 3 active runs (<= 3): r1, r2, r3 should all be retained
+  const r3 = reg.create()
+  r3.setActive(true)
+  assert.equal(reg.size, 3)
+
+  // 4th active run exceeds capacity (> 3): oldest active run r1 must be evicted
+  const r4 = reg.create()
+  r4.setActive(true)
+  assert.equal(reg.get(r1.runId), undefined, 'oldest active run r1 must be evicted when exceeding 1.5x capacity')
+  assert.equal(reg.get(r4.runId) !== undefined, true)
 })
 
 test('mirror execute replays recorded output and errors honestly', async () => {

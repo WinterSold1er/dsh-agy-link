@@ -6,7 +6,10 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { accessSync, constants, existsSync, readdirSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import { homedir } from 'node:os'
+import { randomUUID } from 'node:crypto'
 import type { PluginConfig } from '../common/types.ts'
+import type { RunRecording } from './recording.ts'
+import { StreamJsonParser } from './parser.ts'
 
 const IS_WIN = process.platform === 'win32'
 
@@ -418,4 +421,476 @@ export async function probeProcess(
   const p = startAgyProcess({ bin, args, timeoutMs, signal, env });
   return p.outcome;
 }
+
+export function extractConfigSignature(args: readonly string[]): string {
+  let model = '';
+  let effort = '';
+  let mode = '';
+  const addDirs: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '--model' || a === '-m') {
+      model = args[++i] ?? '';
+    } else if (a.startsWith('--model=')) {
+      model = a.slice('--model='.length);
+    } else if (a === '--effort') {
+      effort = args[++i] ?? '';
+    } else if (a.startsWith('--effort=')) {
+      effort = a.slice('--effort='.length);
+    } else if (a === '--mode') {
+      mode = args[++i] ?? '';
+    } else if (a === '--dangerously-skip-permissions') {
+      mode = 'skip';
+    } else if (a === '--add-dir') {
+      const d = args[++i];
+      if (d) addDirs.push(d);
+    } else if (a.startsWith('--add-dir=')) {
+      addDirs.push(a.slice('--add-dir='.length));
+    }
+  }
+  return JSON.stringify({ model, effort, mode, addDirs: addDirs.sort() });
+}
+
+export interface ResidentChannelOptions {
+  bin: string;
+  args: readonly string[];
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  log?: (msg: string) => void;
+  activityTimeoutMs?: number;
+  onCrash?: (channel: ResidentAgyChannel, error: Error | null) => void;
+}
+
+export interface ResidentTurnOptions {
+  prompt: string;
+  recording: RunRecording;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  parser?: StreamJsonParser;
+  onLine?: (line: string) => void;
+  onInit?: (cid: string) => void;
+}
+
+/**
+ * Resident long-lived agy channel communicating via full-duplex stream-json.
+ * Binds lifecycle to host: no 10-minute idle watchdog, reaped with negative process group SIGTERM.
+ */
+export class ResidentAgyChannel {
+  readonly channelId: string;
+  readonly configSignature: string;
+  private child: ChildProcess | null = null;
+  private readonly parser = new StreamJsonParser();
+  private stdoutBuffer = '';
+  private stderrTail = '';
+  private closed = false;
+  private queue = Promise.resolve();
+  private watchdog: NodeJS.Timeout | null = null;
+
+  private runningTurn: {
+    recording: RunRecording;
+    resolve: (outcome: RunOutcome) => void;
+    reject: (err: Error) => void;
+    startedAt: number;
+    timeoutMs?: number;
+    parser?: StreamJsonParser;
+    onLine?: (line: string) => void;
+    onInit?: (cid: string) => void;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+  } | null = null;
+
+  constructor(private readonly opts: ResidentChannelOptions) {
+    this.channelId = randomUUID();
+    this.configSignature = extractConfigSignature(opts.args);
+  }
+
+  isAlive(): boolean {
+    if (this.closed) return false;
+    if (!this.child) return true;
+    return isProcessAlive(this.child.pid ?? 0);
+  }
+
+  private spawnChild(): void {
+    const viaCmd = IS_WIN && isCmdShim(this.opts.bin);
+    const env = this.opts.env ?? process.env;
+
+    const residentArgs = [...this.opts.args];
+    const isNode = this.opts.bin.endsWith('node') || this.opts.bin.endsWith('node.exe');
+    const scriptIdx = isNode ? residentArgs.findIndex((a) => a.endsWith('.mjs') || a.endsWith('.js')) : -1;
+
+    if (!residentArgs.includes('--input-format')) {
+      if (scriptIdx >= 0) {
+        residentArgs.splice(scriptIdx + 1, 0, '--input-format', 'stream-json');
+      } else {
+        residentArgs.unshift('--input-format', 'stream-json');
+      }
+    }
+    if (!residentArgs.includes('--output-format')) {
+      if (scriptIdx >= 0) {
+        residentArgs.splice(scriptIdx + 3, 0, '--output-format', 'stream-json');
+      } else {
+        residentArgs.unshift('--output-format', 'stream-json');
+      }
+    }
+
+    // Filter out prompt flags (-p / --print) since prompts are piped via stdin stream
+    const cleanArgs: string[] = [];
+    for (let i = 0; i < residentArgs.length; i++) {
+      const arg = residentArgs[i]!;
+      if (arg === '-p' || arg === '--print' || arg === '--prompt') {
+        if (i + 1 < residentArgs.length && !residentArgs[i + 1]!.startsWith('-')) {
+          i++;
+        }
+        continue;
+      }
+      if (arg.startsWith('-p=') || arg.startsWith('--print=') || arg.startsWith('--prompt=')) {
+        continue;
+      }
+      cleanArgs.push(arg);
+    }
+
+    this.stdoutBuffer = '';
+    this.stderrTail = '';
+
+    this.child = viaCmd
+      ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', [this.opts.bin, ...cleanArgs].map(windowsQuote).join(' ')], {
+          cwd: this.opts.cwd,
+          env,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          windowsVerbatimArguments: true,
+          windowsHide: true,
+        })
+      : spawn(this.opts.bin, cleanArgs, {
+          cwd: this.opts.cwd,
+          env,
+          detached: !IS_WIN,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          windowsHide: true,
+        });
+
+    if (this.child.stdout) this.child.stdout.setEncoding('utf8');
+    if (this.child.stderr) this.child.stderr.setEncoding('utf8');
+
+    if (this.child.stdin) {
+      this.child.stdin.on('error', (err) => {
+        this.handleError(err);
+      });
+    }
+
+    const currentChild = this.child;
+    currentChild.stdout?.on('data', (chunk: string) => {
+      if (this.child !== currentChild) return;
+      this.refreshWatchdog();
+      this.handleStdout(chunk);
+    });
+
+    currentChild.stderr?.on('data', (chunk: string) => {
+      if (this.child !== currentChild) return;
+      this.refreshWatchdog();
+      this.stderrTail = (this.stderrTail + chunk).slice(-4096);
+    });
+
+    currentChild.on('exit', (code, signal) => {
+      if (this.child !== currentChild) return;
+      this.handleExit(code, signal);
+    });
+
+    currentChild.on('error', (err) => {
+      if (this.child !== currentChild) return;
+      this.handleError(err);
+    });
+  }
+
+  private refreshWatchdog(): void {
+    const timeoutMs = this.runningTurn?.timeoutMs ?? this.opts.activityTimeoutMs ?? 0;
+    if (timeoutMs <= 0) return;
+    if (this.watchdog) clearTimeout(this.watchdog);
+    this.watchdog = setTimeout(() => {
+      this.opts.log?.(`Resident channel (${this.channelId}) turn timed out after ${timeoutMs}ms of inactivity — recycling process`);
+      this.finishTurn(null, null, true, false);
+    }, timeoutMs);
+  }
+
+  private handleStdout(chunk: string): void {
+    this.stdoutBuffer += chunk;
+    let nl: number;
+    while ((nl = this.stdoutBuffer.indexOf('\n')) >= 0) {
+      const line = this.stdoutBuffer.slice(0, nl).replace(/\r$/, '');
+      this.stdoutBuffer = this.stdoutBuffer.slice(nl + 1);
+      if (this.runningTurn?.onLine) {
+        this.runningTurn.onLine(line);
+      }
+      const parser = this.runningTurn?.parser ?? this.parser;
+      const events = parser.feed(line + '\n');
+      for (const ev of events) {
+        if (this.runningTurn) {
+          this.runningTurn.recording.append(ev);
+          if (ev.kind === 'step' && ev.usage) {
+            this.runningTurn.recording.noteStepUsage(ev.usage);
+          }
+          if (ev.kind === 'init' && ev.conversationId) {
+            this.runningTurn.onInit?.(ev.conversationId);
+          }
+          if (ev.kind === 'result') {
+            if (ev.conversationId !== '') {
+              this.runningTurn.onInit?.(ev.conversationId);
+            }
+            this.finishTurn(0, null, false, false);
+          }
+        }
+      }
+    }
+  }
+
+  private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.runningTurn) {
+      this.finishTurn(code, signal, false, false);
+    }
+    if (!this.closed) {
+      this.opts.log?.(`Resident agy channel (${this.channelId}) process exited (code=${code}, sig=${signal})`);
+      this.opts.onCrash?.(this, null);
+    }
+  }
+
+  private handleError(err: Error): void {
+    this.stderrTail = (this.stderrTail + String(err)).slice(-4096);
+    if (this.runningTurn) {
+      this.finishTurn(null, null, false, false, err);
+    }
+    if (!this.closed) {
+      this.opts.onCrash?.(this, err);
+    }
+  }
+
+  private finishTurn(
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    timedOut: boolean,
+    aborted: boolean,
+    err?: Error,
+  ): void {
+    if (this.watchdog) {
+      clearTimeout(this.watchdog);
+      this.watchdog = null;
+    }
+    if (aborted || timedOut || err) {
+      if (this.child) {
+        const childToKill = this.child;
+        this.child = null;
+        childToKill.removeAllListeners();
+        childToKill.stdout?.removeAllListeners();
+        childToKill.stderr?.removeAllListeners();
+        childToKill.stdin?.removeAllListeners();
+        childToKill.on('error', () => {});
+        try {
+          childToKill.stdin?.end();
+        } catch {}
+        killTree(childToKill);
+      }
+    }
+    if (!this.runningTurn) return;
+    const turn = this.runningTurn;
+    this.runningTurn = null;
+    if (turn.signal && turn.onAbort) {
+      turn.signal.removeEventListener('abort', turn.onAbort);
+    }
+
+    const durationMs = Date.now() - turn.startedAt;
+    if (err) {
+      turn.resolve({
+        code: code ?? 1,
+        signal,
+        timedOut,
+        aborted,
+        stdout: "",
+        stderrTail: this.stderrTail || String(err),
+        durationMs,
+      });
+      return;
+    }
+    turn.resolve({
+      code,
+      signal,
+      timedOut,
+      aborted,
+      stdout: '',
+      stderrTail: this.stderrTail,
+      durationMs,
+    });
+  }
+
+  async sendTurn(opts: ResidentTurnOptions): Promise<RunOutcome> {
+    if (this.closed) {
+      throw new Error('Resident agy channel is closed');
+    }
+    const prev = this.queue;
+    let resolveQueue!: () => void;
+    this.queue = new Promise<void>((r) => { resolveQueue = r; });
+    await prev;
+    try {
+      return await this.executeTurn(opts);
+    } finally {
+      resolveQueue();
+    }
+  }
+
+  private async executeTurn(opts: ResidentTurnOptions): Promise<RunOutcome> {
+    if (!this.child || !isProcessAlive(this.child.pid ?? 0)) {
+      this.spawnChild();
+    }
+
+    return new Promise<RunOutcome>((resolve, reject) => {
+      const startedAt = Date.now();
+      let onAbort: (() => void) | undefined;
+      if (opts.signal) {
+        if (opts.signal.aborted) {
+          if (this.child) {
+            const childToKill = this.child;
+            this.child = null;
+            childToKill.removeAllListeners();
+            childToKill.stdout?.removeAllListeners();
+            childToKill.stderr?.removeAllListeners();
+            childToKill.stdin?.removeAllListeners();
+            childToKill.on('error', () => {});
+            try { childToKill.stdin?.end(); } catch {}
+            killTree(childToKill);
+          }
+          resolve({
+            code: null,
+            signal: null,
+            timedOut: false,
+            aborted: true,
+            stdout: '',
+            stderrTail: '',
+            durationMs: 0,
+          });
+          return;
+        }
+        onAbort = () => {
+          if (this.runningTurn) {
+            this.finishTurn(null, null, false, true);
+          }
+        };
+        opts.signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      this.runningTurn = {
+        recording: opts.recording,
+        resolve,
+        reject,
+        startedAt,
+        timeoutMs: opts.timeoutMs,
+        parser: opts.parser,
+        onLine: opts.onLine,
+        onInit: opts.onInit,
+        signal: opts.signal,
+        onAbort,
+      };
+
+      opts.recording.requestAbort = () => {
+        if (this.runningTurn) {
+          this.finishTurn(null, null, false, true);
+        }
+      };
+
+      const payload = JSON.stringify({
+        event: 'user',
+        message: {
+          role: 'user',
+          content: opts.prompt,
+        },
+      }) + '\n';
+
+      const stdin = this.child?.stdin;
+      if (!stdin || !stdin.writable) {
+        this.finishTurn(null, null, false, false, new Error('Child stdin is not writable'));
+        return;
+      }
+
+      this.refreshWatchdog();
+      const ok = stdin.write(payload, 'utf8', (err) => {
+        if (err) {
+          this.handleError(err);
+        }
+      });
+      if (!ok) {
+        stdin.once('drain', () => {
+          // drain handled
+        });
+      }
+    });
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.runningTurn) {
+      this.finishTurn(null, null, false, true);
+    }
+    if (this.child) {
+      try {
+        this.child.stdin?.end();
+      } catch {
+        // ignore
+      }
+      killTree(this.child);
+      this.child = null;
+    }
+  }
+}
+
+/**
+ * Supervisor managing resident agy channels. Binds lifecycle to host, provides crash self-healing.
+ */
+export class AgyProcessSupervisor {
+  private readonly channels = new Map<string, ResidentAgyChannel>();
+
+  constructor(private readonly defaultLog?: (msg: string) => void) {}
+
+  getChannel(key: string, opts: ResidentChannelOptions): ResidentAgyChannel {
+    let chan = this.channels.get(key);
+    const targetSignature = extractConfigSignature(opts.args);
+    if (chan && chan.isAlive()) {
+      if (chan.configSignature !== targetSignature) {
+        this.defaultLog?.(`Resident channel config signature changed for key ${key}; recycling channel`);
+        chan.close();
+        chan = undefined;
+      }
+    }
+    if (!chan || !chan.isAlive()) {
+      if (chan) {
+        chan.close();
+      }
+      chan = new ResidentAgyChannel({
+        ...opts,
+        log: opts.log ?? this.defaultLog,
+        onCrash: (c, err) => {
+          opts.onCrash?.(c, err);
+          if (this.channels.get(key) === c) {
+            this.channels.delete(key);
+          }
+        },
+      });
+      this.channels.set(key, chan);
+    }
+    return chan;
+  }
+
+  async runTurn(key: string, spawnOpts: ResidentChannelOptions, turnOpts: ResidentTurnOptions): Promise<RunOutcome> {
+    const channel = this.getChannel(key, spawnOpts);
+    return channel.sendTurn(turnOpts);
+  }
+
+  async dispose(): Promise<void> {
+    for (const chan of this.channels.values()) {
+      chan.close();
+    }
+    this.channels.clear();
+  }
+
+  get size(): number {
+    return this.channels.size;
+  }
+}
+
 

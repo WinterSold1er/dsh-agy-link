@@ -19,6 +19,7 @@ import * as dshLlm from '@deepseek-ai/dsh-llm'
 import type { AgyEvent, RawUsage } from '../common/types.ts'
 import { mirrorCallId } from './recording.ts'
 import { buildMirrorRunCode, MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from './mirror-tool.ts'
+import type { SubagentBridge, SubagentSession } from './subagent-bridge.ts'
 
 const toToolCallId: (id: string) => ToolCallId =
   (dshLlm as { ToolCallId?: (id: string) => ToolCallId; CallId?: (id: string) => ToolCallId }).ToolCallId ??
@@ -68,6 +69,7 @@ export interface EventMapperOptions {
     noteStepUsage(raw: RawUsage): void
     finalUsage(resultRaw: RawUsage): RawUsage
   }
+  subagentBridge?: SubagentBridge
 }
 
 export class EventMapper {
@@ -78,6 +80,7 @@ export class EventMapper {
   private readonly announcedTools = new Set<string>()
   private readonly thinkingAnnounced = new Set<string>()
   private readonly subagentAnnounced = new Set<string>()
+  private activeSubagentSession?: SubagentSession
   private sawTextStep: boolean
   private finished = false
 
@@ -226,10 +229,26 @@ export class EventMapper {
         return
       }
       if (ev.stepKind === 'tool' && ev.tool) {
+        if (ev.tool.name === 'invoke_subagent' || ev.tool.name === 'run_subagent') {
+          if (!this.activeSubagentSession) {
+            this.activeSubagentSession = this.opts.subagentBridge?.startSubagent({
+              toolName: ev.tool.name,
+              toolArgs: ev.tool.args,
+            })
+          }
+        }
         // Only a COMPLETED step (output or error recorded) becomes a card.
         // ACTIVE envelopes arrive first with name/args only; the span waits
         // for the DONE update that carries the payload.
         if (!(ev.tool.output !== undefined || ev.tool.error !== undefined)) return
+        const isSubagentTool = ev.tool.name === 'invoke_subagent' || ev.tool.name === 'run_subagent'
+        if (isSubagentTool && this.activeSubagentSession) {
+          this.activeSubagentSession.stop(
+            ev.tool.error,
+            typeof ev.tool.output === 'string' ? ev.tool.output : (ev.tool.output ? JSON.stringify(ev.tool.output) : undefined),
+          )
+          this.activeSubagentSession = undefined
+        }
         if (this.announcedTools.has(ev.stepKey)) return
         this.announcedTools.add(ev.stepKey)
         if (!this.opts.cutOnTool) return // auxiliary calls show no tool detail
@@ -271,6 +290,10 @@ export class EventMapper {
       return;
     }
     // result
+    if (this.activeSubagentSession) {
+      this.activeSubagentSession.stop(ev.error, ev.response)
+      this.activeSubagentSession = undefined
+    }
     if (!ev.ok) {
       // agy reports status=ERROR even when a usable response exists (e.g. a
       // tool timed out mid-run). Keep the answer, surface the error as a
@@ -319,6 +342,10 @@ export class EventMapper {
   /** Terminal error/abort: close what is open, zero usage, failure finish. */
   *emitFailure(kind: 'error' | 'aborted', code: string, message: string): Generator<StreamChunk> {
     if (this.finished) return
+    if (this.activeSubagentSession) {
+      this.activeSubagentSession.stop(message)
+      this.activeSubagentSession = undefined
+    }
     const close = this.closeOpen()
     if (close) yield close
     yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } }

@@ -201,18 +201,25 @@ export function parseMirrorCallId(callId: string): { runId: string; eventIndex: 
 
 export const MAX_RETAINED_RUNS = 64
 export const DEFAULT_RUN_TTL_MS = 10 * 60 * 1000 // 10 minutes
+export const DEFAULT_ACTIVE_RUN_TTL_MS = 30 * 60 * 1000 // 30 minutes hard safety ceiling
 
 /** Bounded registry keeping the most recent runs for continuation spans. */
 export class RunRegistry {
   private readonly maxRuns: number
   private readonly ttlMs: number
+  private readonly activeTtlMs: number
   private readonly runs = new Map<string, RunRecording>()
   private readonly lastAccess = new Map<string, number>()
   private readonly activeSet = new Set<string>()
 
-  constructor(maxRuns: number = MAX_RETAINED_RUNS, ttlMs: number = DEFAULT_RUN_TTL_MS) {
+  constructor(
+    maxRuns: number = MAX_RETAINED_RUNS,
+    ttlMs: number = DEFAULT_RUN_TTL_MS,
+    activeTtlMs: number = DEFAULT_ACTIVE_RUN_TTL_MS,
+  ) {
     this.maxRuns = maxRuns
     this.ttlMs = ttlMs
+    this.activeTtlMs = activeTtlMs
   }
 
   create(): RunRecording {
@@ -224,8 +231,10 @@ export class RunRegistry {
   sweepExpired(now: number = Date.now()): void {
     for (const [id, ts] of this.lastAccess.entries()) {
       const age = now - ts
-      // Inactive runs older than ttlMs, or any run older than 2 * ttlMs (hard safety ceiling)
-      if ((age > this.ttlMs && !this.isActive(id)) || age > this.ttlMs * 2) {
+      // Inactive runs older than ttlMs have expired.
+      // Active runs are protected until the hard activeTtlMs safety ceiling (30-60m default).
+      const expired = !this.isActive(id) ? age > this.ttlMs : age > this.activeTtlMs
+      if (expired) {
         this.forget(id)
       }
     }
@@ -281,6 +290,7 @@ export class RunRegistry {
   }
 
   private evictIfNecessary(): void {
+    const hardMaxCapacity = Math.ceil(this.maxRuns * 1.5)
     while (this.runs.size > this.maxRuns) {
       // Evict oldest inactive run first
       let evictId: string | undefined
@@ -290,9 +300,15 @@ export class RunRegistry {
           break
         }
       }
-      // If all are active, fall back to evicting oldest to honor bounded memory
+      // If all remaining runs are active:
+      // Active runs are protected while runs.size <= hardMaxCapacity (maxRuns * 1.5).
+      // Once capacity exceeds maxRuns * 1.5, force-evict oldest active run to prevent unbounded memory growth.
       if (evictId === undefined) {
-        evictId = this.runs.keys().next().value
+        if (this.runs.size > hardMaxCapacity) {
+          evictId = this.runs.keys().next().value
+        } else {
+          break
+        }
       }
       if (evictId === undefined) break
       this.forget(evictId)

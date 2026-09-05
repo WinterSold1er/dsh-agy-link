@@ -355,6 +355,15 @@ export function presentMirrorCall(args: unknown): ToolCallView | undefined {
       const prompt = pick(input, 'Prompt', 'prompt', 'ImageName', 'image_name') ?? ''
       return { card: 'generic', title: prompt ? `Generate Image: ${prompt}` : 'Generate Image' }
     }
+    case 'invoke_subagent':
+    case 'run_subagent': {
+      const task = pick(input, 'task', 'prompt', 'Task', 'Prompt', 'instruction', 'Instruction') ?? 'Subagent task'
+      const desc = pick(input, 'description', 'Description', 'summary', 'Summary')
+      const agentType = pick(input, 'subagent_type', 'subagentType', 'agent_type', 'agentType', 'role') ?? 'subagent'
+      const title = desc ?? `[${agentType}] ${task}`
+      const view: GenericCallView = { card: 'generic', title, kind: 'other' }
+      return view
+    }
     default: {
       const desc = pick(input, 'Description', 'description', 'toolAction', 'toolSummary')
       const view: GenericCallView = { card: 'generic', title: desc ?? (name !== '' ? name : 'agy tool'), rawInput: input }

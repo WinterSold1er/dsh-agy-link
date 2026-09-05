@@ -16,7 +16,9 @@ import { parseMirrorCallId, type RunRecording, type RunRegistry } from './record
 import { defaultEffortFor, findEntry, ModelCatalog, resolveModelSlug } from './models.ts'
 import { StreamJsonParser } from './parser.ts'
 import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
-import { isolatedHomeEnv, startAgyProcess } from './runner.ts'
+import { isolatedHomeEnv, startAgyProcess, type AgyProcessSupervisor, type RunOutcome } from './runner.ts'
+import { sanitizePromptForAgy } from './skills-bridge.ts'
+import type { SubagentBridge } from './subagent-bridge.ts'
 import { stateDir } from '../common/config.ts'
 import type { SessionStore } from './sessions.ts'
 
@@ -68,6 +70,12 @@ export interface AgyAdapterDeps {
   log?: (msg: string) => void
   /** Recordings shared with the agy_tool mirror (native tool-card mirroring). */
   runs: RunRegistry
+  /** Resident channel supervisor for full-duplex persistent stream connection. */
+  supervisor?: AgyProcessSupervisor
+  /** Subagent bridge for invoke_subagent dispatch and transcript streaming. */
+  subagentBridge?: SubagentBridge
+  /** Provider for staged skills directory path (mounted via --add-dir). */
+  skillsStagingDir?: () => string | undefined
   /**
    * Resolve the DSH session's working directory. Called with the raw
    * session id; return an absolute path to run agy inside that workspace.
@@ -536,7 +544,7 @@ export class AgyAdapter extends LlmAdapter {
       }
     }
     if (cfg.forwardSystemPrompt && options.system) {
-      prompt = 'System instructions:\n' + options.system + '\n\n' + prompt;
+      prompt = 'System instructions:\n' + sanitizePromptForAgy(options.system) + '\n\n' + prompt;
     }
 
     // ---- multimodal staging (v0.2): images ride as staged files ----
@@ -599,6 +607,12 @@ export class AgyAdapter extends LlmAdapter {
     const parser = new StreamJsonParser()
     this.deps.onParser?.(parser)
     let streamCid: string | null = null
+    const stagedSkillsDir = this.deps.skillsStagingDir?.()
+    const allAddDirs = [...stagedDirs]
+    if (stagedSkillsDir && !allAddDirs.includes(stagedSkillsDir)) {
+      allAddDirs.push(stagedSkillsDir)
+    }
+
     const args = this.buildArgs({
       prompt,
       model: activeModel === '' ? cfg.defaultModel : activeModel,
@@ -608,7 +622,7 @@ export class AgyAdapter extends LlmAdapter {
       timeoutMs: cfg.timeoutMs,
       printTimeoutMinutes: Math.max(240, Math.ceil(cfg.timeoutMs / 60_000)),
       extraArgs: cfg.extraArgs,
-      addDirs: stagedDirs,
+      addDirs: allAddDirs,
     })
     const release = await this.deps.acquire()
     let released = false
@@ -656,25 +670,51 @@ export class AgyAdapter extends LlmAdapter {
       this.lastAccountSpawnTime.set(account.id, Date.now())
     }
 
-    let proc: ReturnType<typeof startAgyProcess>
+    let proc: ReturnType<typeof startAgyProcess> | undefined
+    let residentOutcome: Promise<RunOutcome> | undefined
     try {
-      proc = startAgyProcess({
-      bin,
-      args,
-      cwd: workspaceRoot,
-      timeoutMs: cfg.timeoutMs,
-      signal: options.signal,
-      env,
-      onLine: (line) => {
-        for (const ev of parser.feed(line + '\n')) {
-          if (ev.kind === 'init' && ev.conversationId) streamCid = ev.conversationId
-          if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
-          rec.append(ev)
-        }
-      },
-      })
+      if (this.deps.supervisor) {
+        residentOutcome = this.deps.supervisor.runTurn(
+          sessionAccountKey !== '' ? sessionAccountKey : workspaceRoot,
+          {
+            bin,
+            args,
+            cwd: workspaceRoot,
+            env,
+            log: this.deps.log,
+          },
+          {
+            prompt,
+            recording: rec,
+            signal: options.signal,
+            timeoutMs: cfg.timeoutMs,
+            parser,
+            onInit: (cid) => {
+              streamCid = cid
+            },
+          },
+        )
+      } else {
+        proc = startAgyProcess({
+          bin,
+          args,
+          cwd: workspaceRoot,
+          timeoutMs: cfg.timeoutMs,
+          signal: options.signal,
+          env,
+          onLine: (line) => {
+            for (const ev of parser.feed(line + '\n')) {
+              if (ev.kind === 'init' && ev.conversationId) streamCid = ev.conversationId
+              if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
+              rec.append(ev)
+            }
+          },
+        })
+      }
       if (!isAux && sessionKey !== '') {
-        rec.requestAbort = () => proc.kill('abort')
+        if (proc) {
+          rec.requestAbort = () => proc?.kill('abort')
+        }
         this.activeRuns.set(sessionKey, rec)
       }
     } catch (e) {
@@ -683,7 +723,20 @@ export class AgyAdapter extends LlmAdapter {
     }
 
     void (async () => {
-      const outcome = await proc.outcome
+      let outcome: RunOutcome
+      try {
+        outcome = await (residentOutcome ?? proc!.outcome)
+      } catch (e) {
+        releaseOnce()
+        if (this.activeRuns.get(sessionKey) === rec) this.activeRuns.delete(sessionKey)
+        if (!isAux && sessionKey !== '') this.activeSessionPrompts.delete(sessionKey)
+        rec.settle({
+          kind: 'error',
+          code: Err.PROCESS_EXIT,
+          message: 'resident agy channel error: ' + brief(String(e)),
+        })
+        return
+      }
       releaseOnce()
       if (this.activeRuns.get(sessionKey) === rec) this.activeRuns.delete(sessionKey)
       if (!isAux && sessionKey !== '') this.activeSessionPrompts.delete(sessionKey)
@@ -831,6 +884,7 @@ export class AgyAdapter extends LlmAdapter {
         initialSawText: rec.sawTextBefore(from),
         useCodeWrapper,
         usage: rec,
+        subagentBridge: this.deps.subagentBridge,
       })
       let i = from
       try {
