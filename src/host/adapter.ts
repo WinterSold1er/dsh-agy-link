@@ -673,7 +673,7 @@ export class AgyAdapter extends LlmAdapter {
     let proc: ReturnType<typeof startAgyProcess> | undefined
     let residentOutcome: Promise<RunOutcome> | undefined
     try {
-      if (this.deps.supervisor) {
+      if (this.deps.supervisor && !isAux) {
         residentOutcome = this.deps.supervisor.runTurn(
           sessionAccountKey !== '' ? sessionAccountKey : workspaceRoot,
           {
@@ -682,12 +682,14 @@ export class AgyAdapter extends LlmAdapter {
             cwd: workspaceRoot,
             env,
             log: this.deps.log,
+            activityTimeoutMs: cfg.activityTimeoutMs,
           },
           {
             prompt,
             recording: rec,
             signal: options.signal,
             timeoutMs: cfg.timeoutMs,
+            activityTimeoutMs: cfg.activityTimeoutMs,
             parser,
             onInit: (cid) => {
               streamCid = cid
@@ -700,6 +702,7 @@ export class AgyAdapter extends LlmAdapter {
           args,
           cwd: workspaceRoot,
           timeoutMs: cfg.timeoutMs,
+          activityTimeoutMs: cfg.activityTimeoutMs,
           signal: options.signal,
           env,
           onLine: (line) => {
@@ -716,6 +719,8 @@ export class AgyAdapter extends LlmAdapter {
           rec.requestAbort = () => proc?.kill('abort')
         }
         this.activeRuns.set(sessionKey, rec)
+      } else if (proc) {
+        rec.requestAbort = () => proc?.kill('abort')
       }
     } catch (e) {
       releaseOnce()

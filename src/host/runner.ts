@@ -165,6 +165,7 @@ export interface RunOptions {
   args: readonly string[];
   cwd?: string;
   timeoutMs?: number;
+  activityTimeoutMs?: number;
   signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
   onLine?: (line: string) => void;
@@ -332,12 +333,13 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
 
   let watchdog: NodeJS.Timeout | null = null;
   const refreshWatchdog = () => {
-    if (!opts.timeoutMs || opts.timeoutMs <= 0 || settled) return;
+    const timeout = opts.activityTimeoutMs ?? opts.timeoutMs;
+    if (!timeout || timeout <= 0 || settled) return;
     if (watchdog) clearTimeout(watchdog);
     watchdog = setTimeout(() => {
       timedOut = true;
       killTree(child);
-    }, opts.timeoutMs);
+    }, timeout);
   };
   refreshWatchdog();
 
@@ -437,8 +439,12 @@ export function extractConfigSignature(args: readonly string[]): string {
       effort = args[++i] ?? '';
     } else if (a.startsWith('--effort=')) {
       effort = a.slice('--effort='.length);
-    } else if (a === '--mode') {
+    } else if (a === '--mode' || a === '--permission-mode') {
       mode = args[++i] ?? '';
+    } else if (a.startsWith('--mode=')) {
+      mode = a.slice('--mode='.length);
+    } else if (a.startsWith('--permission-mode=')) {
+      mode = a.slice('--permission-mode='.length);
     } else if (a === '--dangerously-skip-permissions') {
       mode = 'skip';
     } else if (a === '--add-dir') {
@@ -450,6 +456,8 @@ export function extractConfigSignature(args: readonly string[]): string {
   }
   return JSON.stringify({ model, effort, mode, addDirs: addDirs.sort() });
 }
+
+export const DEFAULT_ACTIVITY_TIMEOUT_MS = 120_000;
 
 export interface ResidentChannelOptions {
   bin: string;
@@ -466,6 +474,7 @@ export interface ResidentTurnOptions {
   recording: RunRecording;
   signal?: AbortSignal;
   timeoutMs?: number;
+  activityTimeoutMs?: number;
   parser?: StreamJsonParser;
   onLine?: (line: string) => void;
   onInit?: (cid: string) => void;
@@ -483,6 +492,7 @@ export class ResidentAgyChannel {
   private stdoutBuffer = '';
   private stderrTail = '';
   private closed = false;
+  private retired = false;
   private queue = Promise.resolve();
   private watchdog: NodeJS.Timeout | null = null;
 
@@ -492,6 +502,7 @@ export class ResidentAgyChannel {
     reject: (err: Error) => void;
     startedAt: number;
     timeoutMs?: number;
+    activityTimeoutMs?: number;
     parser?: StreamJsonParser;
     onLine?: (line: string) => void;
     onInit?: (cid: string) => void;
@@ -502,6 +513,18 @@ export class ResidentAgyChannel {
   constructor(private readonly opts: ResidentChannelOptions) {
     this.channelId = randomUUID();
     this.configSignature = extractConfigSignature(opts.args);
+  }
+
+  get isRunning(): boolean {
+    return this.runningTurn !== null;
+  }
+
+  retire(): void {
+    this.retired = true;
+  }
+
+  isRetired(): boolean {
+    return this.retired;
   }
 
   isAlive(): boolean {
@@ -602,7 +625,17 @@ export class ResidentAgyChannel {
   }
 
   private refreshWatchdog(): void {
-    const timeoutMs = this.runningTurn?.timeoutMs ?? this.opts.activityTimeoutMs ?? 0;
+    if (!this.runningTurn) {
+      if (this.watchdog) {
+        clearTimeout(this.watchdog);
+        this.watchdog = null;
+      }
+      return;
+    }
+    let timeoutMs = this.runningTurn.activityTimeoutMs ?? this.opts.activityTimeoutMs ?? DEFAULT_ACTIVITY_TIMEOUT_MS;
+    if (this.runningTurn.timeoutMs && this.runningTurn.timeoutMs > 0) {
+      timeoutMs = Math.min(timeoutMs, this.runningTurn.timeoutMs);
+    }
     if (timeoutMs <= 0) return;
     if (this.watchdog) clearTimeout(this.watchdog);
     this.watchdog = setTimeout(() => {
@@ -706,6 +739,9 @@ export class ResidentAgyChannel {
         stderrTail: this.stderrTail || String(err),
         durationMs,
       });
+      if (this.retired) {
+        this.close();
+      }
       return;
     }
     turn.resolve({
@@ -717,10 +753,13 @@ export class ResidentAgyChannel {
       stderrTail: this.stderrTail,
       durationMs,
     });
+    if (this.retired) {
+      this.close();
+    }
   }
 
   async sendTurn(opts: ResidentTurnOptions): Promise<RunOutcome> {
-    if (this.closed) {
+    if (this.closed || this.retired) {
       throw new Error('Resident agy channel is closed');
     }
     const prev = this.queue;
@@ -780,6 +819,7 @@ export class ResidentAgyChannel {
         reject,
         startedAt,
         timeoutMs: opts.timeoutMs,
+        activityTimeoutMs: opts.activityTimeoutMs,
         parser: opts.parser,
         onLine: opts.onLine,
         onInit: opts.onInit,
@@ -824,6 +864,10 @@ export class ResidentAgyChannel {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.watchdog) {
+      clearTimeout(this.watchdog);
+      this.watchdog = null;
+    }
     if (this.runningTurn) {
       this.finishTurn(null, null, false, true);
     }
@@ -844,6 +888,7 @@ export class ResidentAgyChannel {
  */
 export class AgyProcessSupervisor {
   private readonly channels = new Map<string, ResidentAgyChannel>();
+  private readonly retiredChannels = new Set<ResidentAgyChannel>();
 
   constructor(private readonly defaultLog?: (msg: string) => void) {}
 
@@ -852,9 +897,17 @@ export class AgyProcessSupervisor {
     const targetSignature = extractConfigSignature(opts.args);
     if (chan && chan.isAlive()) {
       if (chan.configSignature !== targetSignature) {
-        this.defaultLog?.(`Resident channel config signature changed for key ${key}; recycling channel`);
-        chan.close();
-        chan = undefined;
+        if (chan.isRunning) {
+          this.defaultLog?.(`Resident channel busy with running turn for key ${key}; preserving active turn on retired channel`);
+          chan.retire();
+          this.retiredChannels.add(chan);
+          this.channels.delete(key);
+          chan = undefined;
+        } else {
+          this.defaultLog?.(`Resident channel config signature changed for key ${key}; recycling channel`);
+          chan.close();
+          chan = undefined;
+        }
       }
     }
     if (!chan || !chan.isAlive()) {
@@ -866,6 +919,7 @@ export class AgyProcessSupervisor {
         log: opts.log ?? this.defaultLog,
         onCrash: (c, err) => {
           opts.onCrash?.(c, err);
+          this.retiredChannels.delete(c);
           if (this.channels.get(key) === c) {
             this.channels.delete(key);
           }
@@ -885,7 +939,11 @@ export class AgyProcessSupervisor {
     for (const chan of this.channels.values()) {
       chan.close();
     }
+    for (const chan of this.retiredChannels) {
+      chan.close();
+    }
     this.channels.clear();
+    this.retiredChannels.clear();
   }
 
   get size(): number {

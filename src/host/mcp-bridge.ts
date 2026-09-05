@@ -10,7 +10,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { dshHome } from '../common/config.ts'
 
 export const DSH_MANAGED_PREFIX = 'dsh_managed__'
@@ -63,9 +63,22 @@ export interface ToolsServiceLike {
   execute(input: { callId: string; name: string; arguments: unknown }): Promise<unknown>
 }
 
-/** MCP tool names are [a-zA-Z0-9_-]; DSH names may contain dots. */
-export function toMcpName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_-]/g, '_')
+/**
+ * MCP tool names are [a-zA-Z0-9_-]; DSH names may contain dots or other characters.
+ * Google CLI prepends 'mcp_' + serverName + '_' (28 chars for dsh_managed__dsh_tools)
+ * and requires the final FunctionDeclaration name to strictly match ^[a-zA-Z0-9_-]{1,64}$.
+ * Truncates and appends an 8-char SHA-256 hash when length exceeds maxLen (default 36)
+ * so that both the tool name and the concatenated Google CLI function name never exceed 64 chars.
+ */
+export function toMcpName(name: string, maxLen = 36): string {
+  const sanitized = name.replace(/[^a-zA-Z0-9_-]/g, '_')
+  if (sanitized.length <= maxLen) {
+    return sanitized
+  }
+  const hash = createHash('sha256').update(sanitized).digest('hex').slice(0, 8)
+  const prefixLen = Math.max(1, maxLen - 9)
+  const trimmed = sanitized.slice(0, prefixLen).replace(/_+$/, '') || 'tool'
+  return `${trimmed}_${hash}`
 }
 
 export interface McpBridge {
@@ -177,7 +190,14 @@ export function startMcpBridge(opts: {
           sendJson(res, 503, { error: 'tools service unavailable' })
           return
         }
-        const dshName = typeof parsed.dshName === 'string' ? parsed.dshName : ''
+        let dshName = typeof parsed.dshName === 'string' ? parsed.dshName : ''
+        if (dshName === '') {
+          const rawName = typeof (parsed as { name?: unknown }).name === 'string' ? (parsed as { name: string }).name : ''
+          if (rawName !== '') {
+            const hit = svc.schemas().find((t) => toMcpName(t.name) === rawName || t.name === rawName)
+            if (hit) dshName = hit.name
+          }
+        }
         if (dshName === '' || dshName === 'run_code' || dshName === 'agy_ask') {
           sendJson(res, 400, { error: 'bad tool name' })
           return;

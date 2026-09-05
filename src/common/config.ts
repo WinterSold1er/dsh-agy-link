@@ -83,6 +83,7 @@ export function resolveConfig(
     defaultModel: asString(get('defaultModel')) ?? base.defaultModel,
     defaultEffort: asString(get('defaultEffort')) ?? base.defaultEffort,
     timeoutMs: asNum(get('timeoutMs')) ?? base.timeoutMs,
+    activityTimeoutMs: asNum(get('activityTimeoutMs')) ?? base.activityTimeoutMs,
     maxConcurrent: asNum(get('maxConcurrent')) ?? base.maxConcurrent,
     contextWindowDefault: asNum(get('contextWindowDefault')) ?? base.contextWindowDefault,
     maxTokensDefault: asNum(get('maxTokensDefault')) ?? base.maxTokensDefault,
@@ -127,6 +128,10 @@ export function resolveConfig(
   if (env.DSH_AGY_TIMEOUT_MS) {
     const t = asNum(env.DSH_AGY_TIMEOUT_MS)
     if (t && t > 0) cfg.timeoutMs = t
+  }
+  if (env.DSH_AGY_ACTIVITY_TIMEOUT_MS) {
+    const at = asNum(env.DSH_AGY_ACTIVITY_TIMEOUT_MS)
+    if (at && at > 0) cfg.activityTimeoutMs = at
   }
   if (env.DSH_AGY_EXTRA_ARGS) {
     cfg.extraArgs = env.DSH_AGY_EXTRA_ARGS.split(/\s+/).filter(Boolean)
