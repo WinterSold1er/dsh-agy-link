@@ -26,7 +26,7 @@ export interface PluginConfig {
   defaultEffort: string
   /** Watchdog for one full agy -p run. */
   timeoutMs: number
-  /** Activity watchdog threshold for silence on stdout/stderr before recycling (default 120s). */
+  /** Activity watchdog threshold for silence on stdout/stderr before recycling (default 600s / 10 min). */
   activityTimeoutMs: number
   maxConcurrent: number
   contextWindowDefault: number
@@ -89,7 +89,7 @@ export function defaultConfig(): PluginConfig {
     defaultModel: '',
     defaultEffort: '',
     timeoutMs: 600_000,
-    activityTimeoutMs: 120_000,
+    activityTimeoutMs: 600_000,
     maxConcurrent: 3,
     contextWindowDefault: 1_048_576,
     maxTokensDefault: 65_536,

@@ -355,6 +355,14 @@ export function presentMirrorCall(args: unknown): ToolCallView | undefined {
       const prompt = pick(input, 'Prompt', 'prompt', 'ImageName', 'image_name') ?? ''
       return { card: 'generic', title: prompt ? `Generate Image: ${prompt}` : 'Generate Image' }
     }
+    case 'define_subagent':
+    case 'defineSubagent': {
+      const name = pick(input, 'name', 'role', 'subagent_type', 'agent_type') ?? 'subagent'
+      const desc = pick(input, 'description', 'Description', 'summary')
+      const title = desc ? `Define Subagent: ${name} (${desc})` : `Define Subagent: ${name}`
+      const view: GenericCallView = { card: 'generic', title, kind: 'other', rawInput: input }
+      return view
+    }
     case 'invoke_subagent':
     case 'run_subagent': {
       const task = pick(input, 'task', 'prompt', 'Task', 'Prompt', 'instruction', 'Instruction') ?? 'Subagent task'
@@ -378,6 +386,16 @@ export function presentMirrorResult(args: unknown, result: { content: unknown[];
   const name = typeof a?.tool === 'string' ? a.tool : ''
   const text = resultText(result.content)
   switch (name) {
+    case 'define_subagent':
+    case 'defineSubagent': {
+      const view: GenericResultView = { card: 'generic', content: [{ type: 'text', text: clip(text || 'Subagent defined successfully', 4000) }] }
+      return view
+    }
+    case 'invoke_subagent':
+    case 'run_subagent': {
+      const view: GenericResultView = { card: 'generic', content: [{ type: 'text', text: clip(text || 'Subagent completed', 4000) }] }
+      return view
+    }
     case 'run_command':
     case 'bash':
     case 'execute_command': {

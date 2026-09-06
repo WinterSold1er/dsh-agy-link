@@ -19,6 +19,7 @@ import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
 import { isolatedHomeEnv, startAgyProcess, type AgyProcessSupervisor, type RunOutcome } from './runner.ts'
 import { sanitizePromptForAgy } from './skills-bridge.ts'
 import type { SubagentBridge } from './subagent-bridge.ts'
+import { Heartbeat } from './heartbeat.ts'
 import { stateDir } from '../common/config.ts'
 import type { SessionStore } from './sessions.ts'
 
@@ -27,7 +28,27 @@ type ForeignSource = { source?: { kind?: string; provider?: string } }
 function textOf(m: Message): string {
   const parts: string[] = []
   for (const b of m.content) {
-    if (b.type === 'text') parts.push(b.text)
+    if (b.type === 'text') {
+      parts.push(b.text)
+    } else if (b.type === 'tool-result') {
+      const anyB = b as { content?: unknown[]; text?: string; output?: string; error?: string }
+      if (Array.isArray(anyB.content)) {
+        for (const inner of anyB.content) {
+          if (typeof inner === 'string') parts.push(inner)
+          else if (inner && typeof inner === 'object' && 'text' in inner && typeof (inner as { text: unknown }).text === 'string') {
+            parts.push((inner as { text: string }).text)
+          }
+        }
+      } else if (typeof anyB.content === 'string') {
+        parts.push(anyB.content)
+      } else if (typeof anyB.text === 'string') {
+        parts.push(anyB.text)
+      } else if (typeof anyB.output === 'string') {
+        parts.push(anyB.output)
+      } else if (typeof anyB.error === 'string') {
+        parts.push(anyB.error)
+      }
+    }
   }
   return parts.filter((s) => s !== '').join('\n')
 }
@@ -348,35 +369,33 @@ export class AgyAdapter extends LlmAdapter {
     const continuation = detectContinuation(options.messages)
     if (continuation !== null) {
       const rec = this.deps.runs.get(continuation.runId)
-      if (rec === undefined) {
-        yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } }
-        yield {
-          type: 'finish',
-          reason: {
-            kind: 'error',
-            failure: {
-              message: 'agy run ' + continuation.runId + ' is no longer available (server restarted?) — please resend your message',
-              code: Err.AGY_ERROR,
-            },
-          },
+      const cursor = continuation.eventIndex + 1
+      const isDead = rec !== undefined && (rec.failureInfo !== null || (rec.isSettled && cursor >= rec.length))
+
+      if (isDead || rec === undefined) {
+        if (rec !== undefined) {
+          this.deps.runs.forget(continuation.runId)
+        }
+        this.deps.log?.(
+          `Tombstone guard: run ${continuation.runId} is ${rec === undefined ? 'absent' : rec.failureInfo !== null ? 'failed' : 'exhausted'} — evicted dead corpse, falling through to clean model turn`,
+        )
+      } else {
+        this.deps.runs.markActive(rec.runId, true)
+        let isWaitingForNextTool = false
+        try {
+          for await (const ch of this.driveSpan(rec, cursor, true, isCodeMode, sessionKey, undefined, cfg.workspaceRoot)) {
+            if (ch.type === 'finish' && ch.reason.kind === 'tool-calls') {
+              isWaitingForNextTool = true
+            }
+            yield ch
+          }
+        } finally {
+          if (!isWaitingForNextTool) {
+            this.deps.runs.markActive(rec.runId, false)
+          }
         }
         return
       }
-      this.deps.runs.markActive(rec.runId, true)
-      let isWaitingForNextTool = false
-      try {
-        for await (const ch of this.driveSpan(rec, continuation.eventIndex + 1, true, isCodeMode)) {
-          if (ch.type === 'finish' && ch.reason.kind === 'tool-calls') {
-            isWaitingForNextTool = true
-          }
-          yield ch
-        }
-      } finally {
-        if (!isWaitingForNextTool) {
-          this.deps.runs.markActive(rec.runId, false)
-        }
-      }
-      return
     }
     // Mid-turn steer preemption: DSH claims the steered message at the next
     // step boundary and calls stream() again (a NEW run, not a continuation).
@@ -613,6 +632,9 @@ export class AgyAdapter extends LlmAdapter {
         }
         if (res.staged.length > 0) stagedDirs = [dir]
       }
+      if (prompt.trim() === '' && trailingUser.some((m) => m.content?.some((b) => b.type === 'tool-result'))) {
+        prompt = '[Tool execution completed]'
+      }
       if (prompt.trim() === '') {
         throw new LlmError('request carries no user text or images to forward to agy', Err.AGY_ERROR)
       }
@@ -833,7 +855,7 @@ export class AgyAdapter extends LlmAdapter {
       if (outcome.aborted) {
         failure = { kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' }
       } else if (outcome.timedOut) {
-        failure = { kind: 'error', code: Err.TIMEOUT, message: 'agy run was idle for ' + cfg.timeoutMs + 'ms without output' }
+        failure = { kind: 'error', code: Err.TIMEOUT, message: 'agy run was idle for ' + cfg.activityTimeoutMs + 'ms without output' }
       } else if (sawAuthFailure(parser, outcome)) {
         failure = { kind: 'error', code: Err.AUTH, message: 'agy is not signed in — run /agy auth (or run agy once in a terminal) to login' }
       } else if (isRateLimit) {
@@ -925,7 +947,7 @@ export class AgyAdapter extends LlmAdapter {
     // completed tool step cuts it (or the result finishes it).
     let isWaitingForTool = false
     try {
-      for await (const ch of this.driveSpan(rec, 0, !isAux, isCodeMode)) {
+      for await (const ch of this.driveSpan(rec, 0, !isAux, isCodeMode, sessionKey, account?.dir, workspaceRoot)) {
         if (ch.type === 'finish' && ch.reason.kind === 'tool-calls') {
           isWaitingForTool = true
         }
@@ -950,6 +972,9 @@ export class AgyAdapter extends LlmAdapter {
     from: number,
     cutOnTool: boolean,
     useCodeWrapper: boolean,
+    parentSessionId?: string,
+    accountHome?: string,
+    cwd?: string,
   ): AsyncIterable<StreamChunk> {
     const queue = new ChunkQueue()
     void (async () => {
@@ -960,10 +985,25 @@ export class AgyAdapter extends LlmAdapter {
         useCodeWrapper,
         usage: rec,
         subagentBridge: this.deps.subagentBridge,
+        parentSessionId: parentSessionId !== '' ? parentSessionId : undefined,
+        accountHome,
+        cwd,
       })
+
+      const heartbeat = new Heartbeat({
+        intervalMs: 3000,
+        onBeat: (elapsedSeconds) => {
+          for (const ch of mapper.emitHeartbeat(elapsedSeconds)) {
+            queue.push(ch)
+          }
+        },
+      })
+      heartbeat.start()
+
       let i = from
       try {
         for await (const ev of rec.eventsFrom(from)) {
+          heartbeat.stop()
           for (const ch of mapper.map(ev, i)) queue.push(ch)
           i++
           if (mapper.isFinished) break
@@ -978,6 +1018,8 @@ export class AgyAdapter extends LlmAdapter {
         }
       } catch (err) {
         for (const ch of mapper.emitFailure('error', Err.PROCESS_EXIT, 'internal error: ' + brief(String(err)))) queue.push(ch)
+      } finally {
+        heartbeat.stop()
       }
       queue.close()
     })()
@@ -991,9 +1033,15 @@ export class AgyAdapter extends LlmAdapter {
  * run and the event index to resume after.
  */
 export function detectContinuation(messages: readonly Message[]): { runId: string; eventIndex: number } | null {
-  const last = messages[messages.length - 1]
-  if (last === undefined || last.role !== 'user') return null
-  const src = (last as unknown as { source?: { kind?: string; callId?: string } }).source
-  if (src === undefined || src.kind !== 'tool' || typeof src.callId !== 'string') return null
-  return parseMirrorCallId(src.callId)
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m === undefined || m.role !== 'user') return null
+    const src = (m as unknown as { source?: { kind?: string; callId?: string } }).source
+    if (src?.kind === 'plugin') continue
+    if (src?.kind === 'tool' && typeof src.callId === 'string') {
+      return parseMirrorCallId(src.callId)
+    }
+    return null
+  }
+  return null
 }

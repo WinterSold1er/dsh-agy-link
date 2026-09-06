@@ -70,6 +70,9 @@ export interface EventMapperOptions {
     finalUsage(resultRaw: RawUsage): RawUsage
   }
   subagentBridge?: SubagentBridge
+  parentSessionId?: string
+  accountHome?: string
+  cwd?: string
 }
 
 export class EventMapper {
@@ -127,6 +130,17 @@ export class EventMapper {
   private *emitThinkingLine(thoughtTokens: number): Generator<StreamChunk> {
     yield* this.ensureBlock('reasoning')
     const d = this.appendDelta('[agy thinking turn · ' + thoughtTokens + ' thinking tokens]\n')
+    if (d) yield d
+  }
+
+  /**
+   * Emit a reasoning-delta keepalive pulse chunk.
+   * Ensures a reasoning block is open and appends an elapsed timestamp line.
+   */
+  *emitHeartbeat(elapsedSeconds: number): Generator<StreamChunk> {
+    if (this.finished) return
+    yield* this.ensureBlock('reasoning')
+    const d = this.appendDelta('[Thinking · ' + elapsedSeconds + 's elapsed]\n')
     if (d) yield d
   }
 
@@ -229,11 +243,17 @@ export class EventMapper {
         return
       }
       if (ev.stepKind === 'tool' && ev.tool) {
+        if (ev.tool.name === 'define_subagent' || ev.tool.name === 'defineSubagent') {
+          this.opts.subagentBridge?.defineRole(ev.tool.args)
+        }
         if (ev.tool.name === 'invoke_subagent' || ev.tool.name === 'run_subagent') {
           if (!this.activeSubagentSession) {
             this.activeSubagentSession = this.opts.subagentBridge?.startSubagent({
               toolName: ev.tool.name,
               toolArgs: ev.tool.args,
+              parentSessionId: this.opts.parentSessionId,
+              accountHome: this.opts.accountHome,
+              cwd: this.opts.cwd,
             })
           }
         }

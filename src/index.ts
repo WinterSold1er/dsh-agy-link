@@ -27,12 +27,12 @@ import { StreamJsonParser } from './host/parser.ts'
 import { defaultMediaDir, sweepDir, type ImageRefLike } from './host/media.ts'
 import { startMcpBridge, writeMcpConfig, shadowMergeGeminiMcpConfig, cleanOrphanMcpConfigs, type McpBridge, type ToolsServiceLike } from './host/mcp-bridge.ts'
 import { scanAndStageSkills } from './host/skills-bridge.ts'
-import { SubagentBridge, type SubagentEventEmitter } from './host/subagent-bridge.ts'
+import { SubagentBridge, type SubagentBridgeContext } from './host/subagent-bridge.ts'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-agy-link'
 // webServer and tools are optional: the plugin loads headless too.
-export const inject = ['llm', 'commands']
+export const inject = ['llm', 'commands', 'sessions']
 
 type StatusWriter = {
   writeHead(status: number, headers: Record<string, string>): unknown
@@ -187,7 +187,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const poolAuth = new PoolAuthFlow(pool, quota, log)
   const runs = new RunRegistry()
   const supervisor = new AgyProcessSupervisor(log)
-  const subagentBridge = new SubagentBridge(ctx as unknown as SubagentEventEmitter, log)
+  const subagentBridge = new SubagentBridge(ctx as unknown as SubagentBridgeContext, log)
   const stagedSkills = scanAndStageSkills({ log })
 
   // Boot hygiene: remove staging dirs and purge old historical logs

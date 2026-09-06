@@ -340,6 +340,7 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
       timedOut = true;
       killTree(child);
     }, timeout);
+    watchdog.unref?.();
   };
   refreshWatchdog();
 
@@ -474,7 +475,7 @@ export function extractConfigSignature(args: readonly string[]): string {
   return JSON.stringify({ model, effort, mode, addDirs: addDirs.sort() });
 }
 
-export const DEFAULT_ACTIVITY_TIMEOUT_MS = 120_000;
+export const DEFAULT_ACTIVITY_TIMEOUT_MS = 600_000;
 
 export interface ResidentChannelOptions {
   bin: string;
@@ -689,6 +690,7 @@ export class ResidentAgyChannel {
       this.opts.log?.(`Resident channel (${this.channelId}) turn timed out after ${timeoutMs}ms of inactivity — recycling process`);
       this.finishTurn(null, null, true, false);
     }, timeoutMs);
+    this.watchdog.unref?.();
   }
 
   private handleStdout(chunk: string): void {
