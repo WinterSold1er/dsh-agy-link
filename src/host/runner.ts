@@ -1,5 +1,5 @@
 // Process runner (spec ADR-3): every request spawns a short-lived
-// `agy -p` process as its own process group; abort and watchdog kill the
+// agy process as its own process group; signal abort kills the
 // whole tree (agy re-spawns exec children). stderr is captured as a tail
 // for error attribution; stdout is streamed line-by-line to the caller.
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -165,6 +165,7 @@ export interface RunOptions {
   args: readonly string[];
   cwd?: string;
   timeoutMs?: number;
+  /** @deprecated Activity watchdog removed. */
   activityTimeoutMs?: number;
   signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
@@ -333,7 +334,7 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
 
   let watchdog: NodeJS.Timeout | null = null;
   const refreshWatchdog = () => {
-    const timeout = opts.activityTimeoutMs ?? opts.timeoutMs;
+    const timeout = opts.timeoutMs ?? opts.activityTimeoutMs;
     if (!timeout || timeout <= 0 || settled) return;
     if (watchdog) clearTimeout(watchdog);
     watchdog = setTimeout(() => {
@@ -475,6 +476,7 @@ export function extractConfigSignature(args: readonly string[]): string {
   return JSON.stringify({ model, effort, mode, addDirs: addDirs.sort() });
 }
 
+/** @deprecated Activity watchdog removed; retained for backwards compatibility. */
 export const DEFAULT_ACTIVITY_TIMEOUT_MS = 600_000;
 
 export interface ResidentChannelOptions {
@@ -483,6 +485,7 @@ export interface ResidentChannelOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   log?: (msg: string) => void;
+  /** @deprecated Activity watchdog removed. */
   activityTimeoutMs?: number;
   onCrash?: (channel: ResidentAgyChannel, error: Error | null) => void;
 }
@@ -491,7 +494,9 @@ export interface ResidentTurnOptions {
   prompt: string;
   recording: RunRecording;
   signal?: AbortSignal;
+  /** @deprecated Activity watchdog removed; model runs until signal abort or exit. */
   timeoutMs?: number;
+  /** @deprecated Activity watchdog removed; model runs until signal abort or exit. */
   activityTimeoutMs?: number;
   parser?: StreamJsonParser;
   onLine?: (line: string) => void;
@@ -500,7 +505,8 @@ export interface ResidentTurnOptions {
 
 /**
  * Resident long-lived agy channel communicating via full-duplex stream-json.
- * Binds lifecycle to host: no 10-minute idle watchdog, reaped with negative process group SIGTERM.
+ * Lifecycle is strictly bound to caller: no activity watchdog kills, interruption
+ * only occurs on caller signal abort or natural child process exit/crash.
  */
 export class ResidentAgyChannel {
   readonly channelId: string;
@@ -514,15 +520,12 @@ export class ResidentAgyChannel {
   private closed = false;
   private retired = false;
   private queue = Promise.resolve();
-  private watchdog: NodeJS.Timeout | null = null;
 
   private runningTurn: {
     recording: RunRecording;
     resolve: (outcome: RunOutcome) => void;
     reject: (err: Error) => void;
     startedAt: number;
-    timeoutMs?: number;
-    activityTimeoutMs?: number;
     parser?: StreamJsonParser;
     onLine?: (line: string) => void;
     onInit?: (cid: string) => void;
@@ -651,13 +654,11 @@ export class ResidentAgyChannel {
     const currentChild = this.child;
     currentChild.stdout?.on('data', (chunk: string) => {
       if (this.child !== currentChild) return;
-      this.refreshWatchdog();
       this.handleStdout(chunk);
     });
 
     currentChild.stderr?.on('data', (chunk: string) => {
       if (this.child !== currentChild) return;
-      this.refreshWatchdog();
       this.stderrTail = (this.stderrTail + chunk).slice(-4096);
     });
 
@@ -670,27 +671,6 @@ export class ResidentAgyChannel {
       if (this.child !== currentChild) return;
       this.handleError(err);
     });
-  }
-
-  private refreshWatchdog(): void {
-    if (!this.runningTurn) {
-      if (this.watchdog) {
-        clearTimeout(this.watchdog);
-        this.watchdog = null;
-      }
-      return;
-    }
-    let timeoutMs = this.runningTurn.activityTimeoutMs ?? this.opts.activityTimeoutMs ?? DEFAULT_ACTIVITY_TIMEOUT_MS;
-    if (this.runningTurn.timeoutMs && this.runningTurn.timeoutMs > 0) {
-      timeoutMs = Math.min(timeoutMs, this.runningTurn.timeoutMs);
-    }
-    if (timeoutMs <= 0) return;
-    if (this.watchdog) clearTimeout(this.watchdog);
-    this.watchdog = setTimeout(() => {
-      this.opts.log?.(`Resident channel (${this.channelId}) turn timed out after ${timeoutMs}ms of inactivity — recycling process`);
-      this.finishTurn(null, null, true, false);
-    }, timeoutMs);
-    this.watchdog.unref?.();
   }
 
   private handleStdout(chunk: string): void {
@@ -753,10 +733,6 @@ export class ResidentAgyChannel {
     aborted: boolean,
     err?: Error,
   ): void {
-    if (this.watchdog) {
-      clearTimeout(this.watchdog);
-      this.watchdog = null;
-    }
     if (aborted || timedOut || err) {
       if (this.child) {
         const childToKill = this.child;
@@ -869,8 +845,6 @@ export class ResidentAgyChannel {
         resolve,
         reject,
         startedAt,
-        timeoutMs: opts.timeoutMs,
-        activityTimeoutMs: opts.activityTimeoutMs,
         parser: opts.parser,
         onLine: opts.onLine,
         onInit: opts.onInit,
@@ -898,7 +872,6 @@ export class ResidentAgyChannel {
         return;
       }
 
-      this.refreshWatchdog();
       const ok = stdin.write(payload, 'utf8', (err) => {
         if (err) {
           this.handleError(err);
@@ -915,10 +888,6 @@ export class ResidentAgyChannel {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    if (this.watchdog) {
-      clearTimeout(this.watchdog);
-      this.watchdog = null;
-    }
     if (this.runningTurn) {
       this.finishTurn(null, null, false, true);
     }

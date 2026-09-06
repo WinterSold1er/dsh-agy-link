@@ -266,7 +266,7 @@ dsh plugin --profile web add dsh-agy-link
 | `permissionMode` | `DSH_AGY_MODE` | `skip` | `skip` (recommended) / `plan` (read-only) / `accept-edits` |
 | `defaultModel` | `DSH_AGY_DEFAULT_MODEL` | `(agy default)` | Default model slug |
 | `defaultEffort` | `DSH_AGY_DEFAULT_EFFORT` | `(model default)` | Thinking budget: `low` / `medium` / `high` |
-| `timeoutMs` | `DSH_AGY_TIMEOUT_MS` | `600000` | Activity watchdog timeout in milliseconds |
+| `timeoutMs` | `DSH_AGY_TIMEOUT_MS` | `600000` | Probe and oneshot execution timeout in milliseconds |
 | `workspaceRoot` | `DSH_AGY_WORKSPACE_ROOT` | session cwd | Working directory root |
 
 ---

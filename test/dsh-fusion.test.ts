@@ -358,7 +358,7 @@ rl.on('line', (line) => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('ResidentAgyChannel: activity watchdog times out silent child and recycles process', async () => {
+test('ResidentAgyChannel: silent child is not killed by watchdog, and caller abort recycles process', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'agy-timeout-'))
   const stubBin = join(dir, 'silent-agy.mjs')
 
@@ -377,18 +377,27 @@ rl.on('line', () => {
     bin: process.execPath,
     args: [stubBin],
     cwd: dir,
-    activityTimeoutMs: 100,
   })
 
   const rec = new RunRecording()
-  const outcome = await channel.sendTurn({
+  const ac = new AbortController()
+  const outcomePromise = channel.sendTurn({
     prompt: 'wait',
     recording: rec,
-    timeoutMs: 100,
+    signal: ac.signal,
   })
 
-  assert.equal(outcome.timedOut, true)
-  assert.equal(channel['child'], null, 'stuck process reaped on timeout and child reference cleared')
+  // Verify silent child is allowed to think without being killed by watchdog
+  await new Promise((r) => setTimeout(r, 120))
+  assert.equal(channel.isRunning, true, 'Channel must stay running during silent thinking')
+  assert.notEqual(channel['child'], null, 'Child process must remain alive during silent thinking')
+
+  // Caller abort must cleanly recycle process
+  ac.abort()
+  const outcome = await outcomePromise
+
+  assert.equal(outcome.aborted, true)
+  assert.equal(channel['child'], null, 'aborted process reaped and child reference cleared')
 
   channel.close()
   rmSync(dir, { recursive: true, force: true })

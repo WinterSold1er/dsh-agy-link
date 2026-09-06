@@ -749,14 +749,11 @@ export class AgyAdapter extends LlmAdapter {
             cwd: workspaceRoot,
             env,
             log: this.deps.log,
-            activityTimeoutMs: cfg.activityTimeoutMs,
           },
           {
             prompt,
             recording: rec,
             signal: options.signal,
-            timeoutMs: cfg.timeoutMs,
-            activityTimeoutMs: cfg.activityTimeoutMs,
             parser,
             onInit: (cid) => {
               streamCid = cid
@@ -771,8 +768,6 @@ export class AgyAdapter extends LlmAdapter {
           bin,
           args,
           cwd: workspaceRoot,
-          timeoutMs: cfg.timeoutMs,
-          activityTimeoutMs: cfg.activityTimeoutMs,
           signal: options.signal,
           env,
           onLine: (line) => {
@@ -854,8 +849,6 @@ export class AgyAdapter extends LlmAdapter {
       let failure: { kind: 'error' | 'aborted'; code: string; message: string } | null = null
       if (outcome.aborted) {
         failure = { kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' }
-      } else if (outcome.timedOut) {
-        failure = { kind: 'error', code: Err.TIMEOUT, message: 'agy run was idle for ' + cfg.activityTimeoutMs + 'ms without output' }
       } else if (sawAuthFailure(parser, outcome)) {
         failure = { kind: 'error', code: Err.AUTH, message: 'agy is not signed in — run /agy auth (or run agy once in a terminal) to login' }
       } else if (isRateLimit) {

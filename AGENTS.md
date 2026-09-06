@@ -21,5 +21,5 @@
 
 - **Engine & Bridge**: `dsh-agy-link` bridges Google Antigravity (`agy` CLI) into DeepSeek Harness (DSH).
 - **Tool Mirroring**: Tools executed by agy are mirrored as native DSH tool cards via `agy_tool` dispatched inside `run_code`.
-- **Idle Activity Watchdog**: Timeout management uses an activity-based idle watchdog (`refreshWatchdog`), rearming on stdout/stderr data, with a generous print-mode budget passed to the agy CLI.
+- **Process Lifecycle & Keepalive Heartbeat**: Child processes run without idle watchdog timeouts, allowing deep thinking for as long as needed. Interruption is strictly limited to caller signal aborts or natural child process exit/crash. A 3-second streaming Heartbeat keeps frontend interaction alive and prevents reverse proxy disconnections.
 - **Protocol Fidelity**: Maintain lossless JSON chunks (no undefined properties), accurate reasoning annotations, and resilient event mapping across multi-turn continuations.

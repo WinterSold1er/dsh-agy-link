@@ -32,11 +32,11 @@ function mockCatalog(): ModelCatalog {
   return new ModelCatalog(async () => { throw new Error('no disc') }, defaultConfig().fallbackModels, 300_000)
 }
 
-test('10分钟看门狗默认值对齐与文案修复', () => {
+test('活动看门狗强杀逻辑彻底拔除：允许长时思考，只认主动中止或进程崩溃', () => {
   const cfg = defaultConfig()
-  // 1. activityTimeoutMs 默认值对齐到 10 分钟 (600_000ms)
-  assert.equal(cfg.activityTimeoutMs, 600_000, 'PluginConfig.activityTimeoutMs must default to 600_000ms (10 minutes)')
-  assert.equal(DEFAULT_ACTIVITY_TIMEOUT_MS, 600_000, 'DEFAULT_ACTIVITY_TIMEOUT_MS must default to 600_000ms (10 minutes)')
+  // timeoutMs defaults to 600_000ms; activityTimeoutMs is deprecated and removed from default config
+  assert.equal(cfg.timeoutMs, 600_000, 'PluginConfig.timeoutMs must default to 600_000ms (10 minutes)')
+  assert.equal(cfg.activityTimeoutMs, undefined, 'activityTimeoutMs must be removed from default config')
 })
 
 test('死尸重放死锁根治 (Tombstone Guard): 已死亡的 Run 严禁瞬间重放错误，必须驱逐并降级为全新轮次', async () => {

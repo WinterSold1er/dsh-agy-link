@@ -230,13 +230,12 @@ rl.on('line', (line) => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('QA-RES-04: Activity Watchdog timeout vs live chunk refresh', async () => {
+test('QA-RES-04: Resident channel allows silent thinking and clean abort without watchdog kills', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'qa-res-watchdog-'))
   const stubBin = join(dir, 'streaming-agy.mjs')
 
-  // Emits chunks at 40ms intervals (total duration 160ms + startup).
-  // With activityTimeoutMs = 160ms, if not refreshed, total duration > 160ms will time out.
-  // If prompt is 'silent', it outputs nothing and times out.
+  // Silent prompt outputs nothing (thinking); stream prompt streams chunks.
+  // Neither is killed by any activity watchdog.
   writeFileSync(
     stubBin,
     `#!/usr/bin/env node
@@ -270,27 +269,35 @@ rl.on('line', async (line) => {
     bin: process.execPath,
     args: [stubBin],
     cwd: dir,
-    activityTimeoutMs: 160, // 160ms inactivity threshold
   })
 
-  // 1. Silent turn: must trigger timeout
+  // 1. Silent turn: must remain alive during silence and abort cleanly on signal
   const rec1 = new RunRecording()
-  const outcome1 = await channel.sendTurn({
+  const ac = new AbortController()
+  const turnPromise1 = channel.sendTurn({
     prompt: 'silent',
     recording: rec1,
-    timeoutMs: 160,
+    signal: ac.signal,
   })
-  assert.equal(outcome1.timedOut, true, 'Silent child must trigger activity watchdog timeout')
 
-  // 2. Streaming turn: total time > 160ms, but chunks every 40ms refresh watchdog
+  await new Promise((r) => setTimeout(r, 120))
+  assert.equal(channel.isRunning, true, 'Channel must remain alive during silent thinking')
+  assert.notEqual(channel['child'], null, 'Child process must remain alive during silence')
+
+  ac.abort()
+  const outcome1 = await turnPromise1
+  assert.equal(outcome1.aborted, true, 'Aborted silent turn must report aborted: true')
+  assert.equal(channel['child'], null, 'Aborted child process must be cleaned up')
+
+  // 2. Streaming turn: completes without timeout
   const rec2 = new RunRecording()
   const outcome2 = await channel.sendTurn({
     prompt: 'stream',
     recording: rec2,
-    timeoutMs: 160,
   })
 
-  assert.equal(outcome2.timedOut, false, 'Watchdog must refresh on active output chunks without timing out')
+  assert.equal(outcome2.aborted, false)
+  assert.equal(outcome2.timedOut, false)
   assert.equal(rec2.getResultEvent()?.response, 'part1part2part3part4')
 
   channel.close()

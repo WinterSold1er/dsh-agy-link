@@ -88,7 +88,7 @@ export function resolveConfig(
     defaultModel: asString(get('defaultModel')) ?? base.defaultModel,
     defaultEffort: asString(get('defaultEffort')) ?? base.defaultEffort,
     timeoutMs: asNum(get('timeoutMs')) ?? base.timeoutMs,
-    activityTimeoutMs: asNum(get('activityTimeoutMs')) ?? base.activityTimeoutMs,
+    activityTimeoutMs: asNum(get('activityTimeoutMs')),
     maxConcurrent: asNum(get('maxConcurrent')) ?? base.maxConcurrent,
     contextWindowDefault: asNum(get('contextWindowDefault')) ?? base.contextWindowDefault,
     maxTokensDefault: asNum(get('maxTokensDefault')) ?? base.maxTokensDefault,

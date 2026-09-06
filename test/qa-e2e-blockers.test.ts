@@ -238,11 +238,11 @@ if (isStream) {
 // BLOCKER-3: Silent Child / Soft-Deny Activity Watchdog
 // ============================================================================
 
-test('BLOCKER-3: activity watchdog recovers stuck resident channel when child produces no output', async () => {
+test('BLOCKER-3: silent thinking child is not killed by watchdog, and abort cleans up cleanly', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'qa-blocker3-watchdog-'))
   const stubBin = join(dir, 'soft-deny-agy.mjs')
 
-  // Script simulates a soft-deny or subagent hang where no result event is emitted
+  // Script simulates a soft-deny or long thinking where no result event is emitted immediately
   writeFileSync(
     stubBin,
     `#!/usr/bin/env node
@@ -251,7 +251,7 @@ const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   const msg = JSON.parse(line);
   if (msg.message?.content === 'hang') {
-    // Model soft-denies or hangs: outputs nothing, no result event
+    // Model thinking silently: outputs nothing
     return;
   }
   process.stdout.write(JSON.stringify({
@@ -266,29 +266,35 @@ rl.on('line', (line) => {
     bin: process.execPath,
     args: [stubBin],
     cwd: dir,
-    activityTimeoutMs: 120, // 120ms activity watchdog
   })
 
-  // 1. Silent hang turn: must trigger timeout after 120ms
+  // 1. Silent thinking turn: must NOT be killed by watchdog, remains alive
   const rec1 = new RunRecording()
-  const outcome1 = await channel.sendTurn({
+  const ac = new AbortController()
+  const turnPromise1 = channel.sendTurn({
     prompt: 'hang',
     recording: rec1,
-    timeoutMs: 120,
+    signal: ac.signal,
   })
 
-  assert.equal(outcome1.timedOut, true, 'Silent child must time out via activity watchdog')
-  assert.equal(channel['child'], null, 'Hanging child process must be reaped and cleared')
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(channel.isRunning, true, 'Channel must stay running during silent thinking')
+  assert.notEqual(channel['child'], null, 'Child process must remain alive during silence')
 
-  // 2. Next turn: channel spawns fresh child and succeeds cleanly
+  // 2. User abort cleanly reaps the process
+  ac.abort()
+  const outcome1 = await turnPromise1
+  assert.equal(outcome1.aborted, true, 'Aborted turn must report aborted: true')
+  assert.equal(channel['child'], null, 'Aborted child process must be reaped and cleared')
+
+  // 3. Next turn: channel spawns fresh child and succeeds cleanly
   const rec2 = new RunRecording()
   const outcome2 = await channel.sendTurn({
     prompt: 'normal',
     recording: rec2,
-    timeoutMs: 1200,
   })
 
-  assert.equal(outcome2.timedOut, false)
+  assert.equal(outcome2.aborted, false)
   assert.equal(rec2.getResultEvent()?.response, 'ok', 'Subsequent turn must succeed with fresh child')
 
   channel.close()
