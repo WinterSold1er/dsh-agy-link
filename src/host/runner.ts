@@ -424,6 +424,19 @@ export async function probeProcess(
   return p.outcome;
 }
 
+export function extractConversationId(args: readonly string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '--conversation' || a === '-c') {
+      return args[i + 1];
+    }
+    if (a.startsWith('--conversation=')) {
+      return a.slice('--conversation='.length);
+    }
+  }
+  return undefined;
+}
+
 export function extractConfigSignature(args: readonly string[]): string {
   let model = '';
   let effort = '';
@@ -452,6 +465,10 @@ export function extractConfigSignature(args: readonly string[]): string {
       if (d) addDirs.push(d);
     } else if (a.startsWith('--add-dir=')) {
       addDirs.push(a.slice('--add-dir='.length));
+    } else if (a === '--conversation' || a === '-c') {
+      i++;
+    } else if (a.startsWith('--conversation=')) {
+      // skip runtime conversation context flag
     }
   }
   return JSON.stringify({ model, effort, mode, addDirs: addDirs.sort() });
@@ -487,6 +504,8 @@ export interface ResidentTurnOptions {
 export class ResidentAgyChannel {
   readonly channelId: string;
   readonly configSignature: string;
+  private opts: ResidentChannelOptions;
+  private _lastConversationId?: string;
   private child: ChildProcess | null = null;
   private readonly parser = new StreamJsonParser();
   private stdoutBuffer = '';
@@ -510,9 +529,33 @@ export class ResidentAgyChannel {
     onAbort?: () => void;
   } | null = null;
 
-  constructor(private readonly opts: ResidentChannelOptions) {
+  constructor(opts: ResidentChannelOptions) {
+    this.opts = opts;
     this.channelId = randomUUID();
     this.configSignature = extractConfigSignature(opts.args);
+    this._lastConversationId = extractConversationId(opts.args);
+  }
+
+  get args(): readonly string[] {
+    return this.opts.args;
+  }
+
+  get lastConversationId(): string | undefined {
+    return this._lastConversationId;
+  }
+
+  setLastConversationId(cid: string): void {
+    if (cid) {
+      this._lastConversationId = cid;
+    }
+  }
+
+  updateOptions(opts: ResidentChannelOptions): void {
+    this.opts = opts;
+    const cid = extractConversationId(opts.args);
+    if (cid) {
+      this._lastConversationId = cid;
+    }
   }
 
   get isRunning(): boolean {
@@ -570,6 +613,10 @@ export class ResidentAgyChannel {
         continue;
       }
       cleanArgs.push(arg);
+    }
+
+    if (this._lastConversationId && !cleanArgs.includes('--conversation') && !cleanArgs.some((a) => a.startsWith('--conversation='))) {
+      cleanArgs.push('--conversation', this._lastConversationId);
     }
 
     this.stdoutBuffer = '';
@@ -662,10 +709,12 @@ export class ResidentAgyChannel {
             this.runningTurn.recording.noteStepUsage(ev.usage);
           }
           if (ev.kind === 'init' && ev.conversationId) {
+            this._lastConversationId = ev.conversationId;
             this.runningTurn.onInit?.(ev.conversationId);
           }
           if (ev.kind === 'result') {
             if (ev.conversationId !== '') {
+              this._lastConversationId = ev.conversationId;
               this.runningTurn.onInit?.(ev.conversationId);
             }
             this.finishTurn(0, null, false, false);
@@ -889,14 +938,40 @@ export class ResidentAgyChannel {
 export class AgyProcessSupervisor {
   private readonly channels = new Map<string, ResidentAgyChannel>();
   private readonly retiredChannels = new Set<ResidentAgyChannel>();
+  private readonly conversationIds = new Map<string, string>();
 
   constructor(private readonly defaultLog?: (msg: string) => void) {}
+
+  getConversationId(key: string): string | undefined {
+    return this.conversationIds.get(key) ?? this.channels.get(key)?.lastConversationId;
+  }
+
+  setConversationId(key: string, conversationId: string): void {
+    if (conversationId) {
+      this.conversationIds.set(key, conversationId);
+      this.channels.get(key)?.setLastConversationId(conversationId);
+    }
+  }
+
+  deleteConversationId(key: string): void {
+    this.conversationIds.delete(key);
+  }
 
   getChannel(key: string, opts: ResidentChannelOptions): ResidentAgyChannel {
     let chan = this.channels.get(key);
     const targetSignature = extractConfigSignature(opts.args);
+    const newSig = JSON.parse(targetSignature) as { model?: string };
+
     if (chan && chan.isAlive()) {
+      const oldSig = JSON.parse(chan.configSignature) as { model?: string };
+      const modelChanged = Boolean(oldSig.model && newSig.model && oldSig.model !== newSig.model);
+      if (modelChanged) {
+        this.conversationIds.delete(key);
+      }
       if (chan.configSignature !== targetSignature) {
+        if (!modelChanged && chan.lastConversationId && !this.conversationIds.has(key)) {
+          this.conversationIds.set(key, chan.lastConversationId);
+        }
         if (chan.isRunning) {
           this.defaultLog?.(`Resident channel busy with running turn for key ${key}; preserving active turn on retired channel`);
           chan.retire();
@@ -910,21 +985,44 @@ export class AgyProcessSupervisor {
         }
       }
     }
-    if (!chan || !chan.isAlive()) {
+
+    const explicitCid = extractConversationId(opts.args);
+    if (explicitCid) {
+      this.conversationIds.set(key, explicitCid);
+    }
+    const knownCid = explicitCid ?? this.conversationIds.get(key);
+    let effectiveOpts = opts;
+    if (knownCid && !opts.args.includes('--conversation') && !opts.args.some((a) => a.startsWith('--conversation='))) {
+      const args = [...opts.args];
+      const pIdx = args.indexOf('-p');
+      if (pIdx >= 0) {
+        args.splice(pIdx, 0, '--conversation', knownCid);
+      } else {
+        args.push('--conversation', knownCid);
+      }
+      effectiveOpts = { ...opts, args };
+    }
+
+    if (chan && chan.isAlive()) {
+      chan.updateOptions(effectiveOpts);
+    } else {
       if (chan) {
         chan.close();
       }
       chan = new ResidentAgyChannel({
-        ...opts,
-        log: opts.log ?? this.defaultLog,
+        ...effectiveOpts,
+        log: effectiveOpts.log ?? this.defaultLog,
         onCrash: (c, err) => {
-          opts.onCrash?.(c, err);
+          effectiveOpts.onCrash?.(c, err);
           this.retiredChannels.delete(c);
           if (this.channels.get(key) === c) {
             this.channels.delete(key);
           }
         },
       });
+      if (knownCid) {
+        chan.setLastConversationId(knownCid);
+      }
       this.channels.set(key, chan);
     }
     return chan;
@@ -932,7 +1030,16 @@ export class AgyProcessSupervisor {
 
   async runTurn(key: string, spawnOpts: ResidentChannelOptions, turnOpts: ResidentTurnOptions): Promise<RunOutcome> {
     const channel = this.getChannel(key, spawnOpts);
-    return channel.sendTurn(turnOpts);
+    const wrappedOnInit = (cid: string) => {
+      if (cid) {
+        this.conversationIds.set(key, cid);
+      }
+      turnOpts.onInit?.(cid);
+    };
+    return channel.sendTurn({
+      ...turnOpts,
+      onInit: wrappedOnInit,
+    });
   }
 
   async dispose(): Promise<void> {
@@ -944,6 +1051,7 @@ export class AgyProcessSupervisor {
     }
     this.channels.clear();
     this.retiredChannels.clear();
+    this.conversationIds.clear();
   }
 
   get size(): number {

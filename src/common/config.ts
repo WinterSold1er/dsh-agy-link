@@ -9,16 +9,16 @@ import { join } from 'node:path'
 
 export interface OverridesFile { [key: string]: unknown }
 
-export function dshHome(): string {
-  return process.env.DSH_HOME ?? join(homedir(), '.dsh')
+export function dshHome(env: NodeJS.ProcessEnv = process.env): string {
+  return env.DSH_HOME ?? join(homedir(), '.dsh')
 }
 
-export function stateDir(): string {
-  return join(dshHome(), 'agy-link')
+export function stateDir(env: NodeJS.ProcessEnv = process.env): string {
+  return join(dshHome(env), 'agy-link')
 }
 
-export function overridesPath(): string {
-  return join(stateDir(), 'runtime-overrides.json')
+export function overridesPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(stateDir(env), 'runtime-overrides.json')
 }
 
 function readJson(file: string): Record<string, unknown> {
@@ -63,13 +63,18 @@ function asMode(v: unknown): PermissionMode | undefined {
 export function resolveConfig(
   entry: Record<string, unknown> | undefined,
   env: NodeJS.ProcessEnv = process.env,
-  overrides: OverridesFile = readOverrides(),
+  overrides?: OverridesFile,
 ): PluginConfig {
   const base = defaultConfig()
   const e = entry ?? {}
-  const layers: Array<Record<string, unknown>> = [e, overrides]
+  const o = overrides ?? readOverrides(overridesPath(env))
+  const layers: Array<Record<string, unknown>> = [o, e]
   const get = (k: string): unknown => {
-    for (const l of layers) if (l[k] !== undefined && l[k] !== null && l[k] !== '') return l[k]
+    for (const l of layers) {
+      if (l[k] !== undefined && l[k] !== null) {
+        if (l === o || l[k] !== '') return l[k]
+      }
+    }
     return undefined
   }
   const cfg: PluginConfig = {

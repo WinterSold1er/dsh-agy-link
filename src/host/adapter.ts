@@ -137,6 +137,10 @@ export class AgyAdapter extends LlmAdapter {
   private readonly warnedKeys = new Set<string>()
   /** sessionKey -> in-flight run, for steer-time preemption. */
   private readonly activeRuns = new Map<string, RunRecording>()
+  /** sessionKey -> last seen conversationId for cross-process conversation inheritance */
+  private readonly lastConversationIds = new Map<string, string>()
+  /** sessionKey -> last seen model for cross-process model switch detection */
+  private readonly lastSessionModels = new Map<string, string>()
   /** sessionKey -> prompt info for duplicate submission debounce */
   private readonly activeSessionPrompts = new Map<string, { prompt: string; startedAt: number }>()
   /** accountId -> timestamp of last spawn for spacing throttling */
@@ -147,6 +151,16 @@ export class AgyAdapter extends LlmAdapter {
 
   constructor(private readonly deps: AgyAdapterDeps) {
     super()
+  }
+
+  getLastConversationId(sessionKey: string): string | undefined {
+    return this.lastConversationIds.get(sessionKey)
+  }
+
+  setLastConversationId(sessionKey: string, conversationId: string): void {
+    if (sessionKey && conversationId) {
+      this.lastConversationIds.set(sessionKey, conversationId)
+    }
   }
 
   private warnOnce(key: string, msg: string): void {
@@ -495,16 +509,34 @@ export class AgyAdapter extends LlmAdapter {
 
     // Model switch detection: If model changed in the session, drop stale agy conversation binding
     const currentModel = activeModel === '' ? cfg.defaultModel : activeModel
-    if (!isAux && binding !== undefined && binding.model && binding.model !== currentModel) {
-      if (sessionAccountKey !== '') this.deps.store.delete(sessionAccountKey)
+    const prevModel = binding?.model ?? (sessionKey !== '' ? this.lastSessionModels.get(sessionKey) : undefined)
+    if (!isAux && prevModel && prevModel !== currentModel) {
+      if (sessionAccountKey !== '') {
+        this.deps.store.delete(sessionAccountKey)
+        this.deps.supervisor?.deleteConversationId(sessionAccountKey)
+      }
+      if (sessionKey !== '') {
+        this.lastConversationIds.delete(sessionKey)
+        this.deps.supervisor?.deleteConversationId(sessionKey)
+      }
       binding = undefined
+    }
+    if (!isAux && sessionKey !== '') {
+      this.lastSessionModels.set(sessionKey, currentModel)
     }
 
     // Compaction detection (ADR-013): If DSH compacted history or cleared earlier turns,
     // messages.length drops below the recorded watermark. Invalidate the stale agy
     // conversation binding so a clean agy session is started and seeded with the compacted summary.
     if (!isAux && binding !== undefined && messages.length < binding.lastMessageCount) {
-      if (sessionAccountKey !== '') this.deps.store.delete(sessionAccountKey)
+      if (sessionAccountKey !== '') {
+        this.deps.store.delete(sessionAccountKey)
+        this.deps.supervisor?.deleteConversationId(sessionAccountKey)
+      }
+      if (sessionKey !== '') {
+        this.lastConversationIds.delete(sessionKey)
+        this.deps.supervisor?.deleteConversationId(sessionKey)
+      }
       binding = undefined
     }
 
@@ -613,17 +645,30 @@ export class AgyAdapter extends LlmAdapter {
       allAddDirs.push(stagedSkillsDir)
     }
 
+    const existingConversationId = !isAux
+      ? (binding?.conversationId ?? (sessionKey !== '' ? this.lastConversationIds.get(sessionKey) : undefined))
+      : undefined
+
     const args = this.buildArgs({
       prompt,
       model: activeModel === '' ? cfg.defaultModel : activeModel,
       effort,
-      conversationId: !isAux && binding !== undefined ? binding.conversationId : undefined,
+      conversationId: existingConversationId,
       permissionMode: isAux ? 'plan' : cfg.permissionMode,
       timeoutMs: cfg.timeoutMs,
       printTimeoutMinutes: Math.max(240, Math.ceil(cfg.timeoutMs / 60_000)),
       extraArgs: cfg.extraArgs,
       addDirs: allAddDirs,
     })
+
+    if (!isAux && existingConversationId && !args.includes('--conversation') && !args.some((a) => a.startsWith('--conversation='))) {
+      const pIdx = args.indexOf('-p')
+      if (pIdx >= 0) {
+        args.splice(pIdx, 0, '--conversation', existingConversationId)
+      } else {
+        args.push('--conversation', existingConversationId)
+      }
+    }
     const release = await this.deps.acquire()
     let released = false
     const releaseOnce = (): void => {
@@ -693,6 +738,9 @@ export class AgyAdapter extends LlmAdapter {
             parser,
             onInit: (cid) => {
               streamCid = cid
+              if (sessionKey !== '' && cid) {
+                this.lastConversationIds.set(sessionKey, cid)
+              }
             },
           },
         )
@@ -707,8 +755,14 @@ export class AgyAdapter extends LlmAdapter {
           env,
           onLine: (line) => {
             for (const ev of parser.feed(line + '\n')) {
-              if (ev.kind === 'init' && ev.conversationId) streamCid = ev.conversationId
-              if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
+              if (ev.kind === 'init' && ev.conversationId) {
+                streamCid = ev.conversationId
+                if (sessionKey !== '') this.lastConversationIds.set(sessionKey, ev.conversationId)
+              }
+              if (ev.kind === 'result' && ev.conversationId !== '') {
+                streamCid = ev.conversationId
+                if (sessionKey !== '') this.lastConversationIds.set(sessionKey, ev.conversationId)
+              }
               rec.append(ev)
             }
           },
@@ -749,8 +803,20 @@ export class AgyAdapter extends LlmAdapter {
         if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
         rec.append(ev)
       }
+      if (!streamCid) {
+        for (let i = rec.length - 1; i >= 0; i--) {
+          const ev = rec.eventAt(i)
+          if (ev && (ev.kind === 'result' || ev.kind === 'init') && ev.conversationId) {
+            streamCid = ev.conversationId
+            break
+          }
+        }
+      }
       const diffed = diffConversations(before).conversationId
       const conversationId = streamCid ?? diffed
+      if (sessionKey !== '' && conversationId) {
+        this.lastConversationIds.set(sessionKey, conversationId)
+      }
       // A result envelope the mapper will finish on: ok, or an error that
       // still carries a usable response. Anything else leaves the live span
       // un-finished, so the failure below reaches it through the recording.
@@ -809,6 +875,7 @@ export class AgyAdapter extends LlmAdapter {
         if (!isAux && sessionAccountKey !== '') {
           const finalId = binding !== undefined ? binding.conversationId : conversationId
           if (finalId) {
+            if (sessionKey !== '') this.lastConversationIds.set(sessionKey, finalId)
             this.deps.store.set(sessionAccountKey, {
               conversationId: finalId,
               lastMessageCount: messages.length,
@@ -836,6 +903,9 @@ export class AgyAdapter extends LlmAdapter {
           ) {
             // If auth expired or rate limit hit or conversation rejected, drop stale binding
             this.deps.store.delete(sessionAccountKey)
+            if (sessionKey !== '') this.lastConversationIds.delete(sessionKey)
+            this.deps.supervisor?.deleteConversationId(sessionAccountKey)
+            if (sessionKey !== '') this.deps.supervisor?.deleteConversationId(sessionKey)
           }
         }
       }
