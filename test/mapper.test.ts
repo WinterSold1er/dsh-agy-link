@@ -314,6 +314,51 @@ test('DONE tail with usage but no text still annotates after streamed text', () 
   assert.equal(text, 'Answer.')
 })
 
+test('regression: deferred thinking tokens on DONE tail must strictly close reasoning block', () => {
+  function assertAllBlocksPaired(chunks: StreamChunk[]) {
+    const openStarts = new Map<number, string>()
+    for (const c of chunks) {
+      if (c.type === 'block-start') {
+        assert.ok(!openStarts.has(c.index), `Duplicate block-start for index ${c.index}`)
+        openStarts.set(c.index, c.blockType)
+      } else if (c.type === 'block-end') {
+        assert.ok(openStarts.has(c.index), `Unmatched block-end for index ${c.index}`)
+        openStarts.delete(c.index)
+      }
+    }
+    assert.equal(
+      openStarts.size,
+      0,
+      `Dangling unclosed block-starts: ${[...openStarts.entries()].map(([i, t]) => `${t}#${i}`).join(', ')}`
+    )
+  }
+
+  // Case 1: Streamed text followed by empty DONE tail carrying thinking_tokens (no result event yet)
+  const m1 = newSpan('r-tail-no-result')
+  const chunks1 = mapAll(m1, [
+    { kind: 'step', stepKey: '10', stepKind: 'text', text: 'Sentence text.', fragment: true },
+    { kind: 'step', stepKey: '10', stepKind: 'text', text: '', usage: { thinking_tokens: 42 } },
+  ])
+  assertAllBlocksPaired(chunks1)
+
+  // Case 2: Streamed text where the final fragment itself carries thinking_tokens (no result event yet)
+  const m2 = newSpan('r-frag-no-result')
+  const chunks2 = mapAll(m2, [
+    { kind: 'step', stepKey: '11', stepKind: 'text', text: 'First part, ', fragment: true },
+    { kind: 'step', stepKey: '11', stepKind: 'text', text: 'second part.', fragment: true, usage: { thinking_tokens: 18 } },
+  ])
+  assertAllBlocksPaired(chunks2)
+
+  // Case 3: Case 1 followed by normal result event: strictly no double-close, all blocks paired
+  const m3 = newSpan('r-tail-with-result')
+  const chunks3 = mapAll(m3, [
+    { kind: 'step', stepKey: '12', stepKind: 'text', text: 'Finished text.', fragment: true },
+    { kind: 'step', stepKey: '12', stepKind: 'text', text: '', usage: { thinking_tokens: 99 } },
+    { kind: 'result', conversationId: 'c12', ok: true, response: 'Finished text.', usage: {} },
+  ])
+  assertAllBlocksPaired(chunks3)
+})
+
 test('emitFailure closes blocks and finishes with error', () => {
   const m = newSpan()
   const chunks = mapAll(m, [

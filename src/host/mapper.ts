@@ -183,6 +183,8 @@ export class EventMapper {
           if (deferred) {
             this.thinkingAnnounced.add(ev.stepKey)
             yield* this.emitThinkingLine(thoughtTokens)
+            const close = this.closeOpen()
+            if (close) yield close
           }
           return
         }
@@ -207,6 +209,8 @@ export class EventMapper {
           // complete sentence, never between two of its fragments.
           this.thinkingAnnounced.add(ev.stepKey)
           yield* this.emitThinkingLine(thoughtTokens)
+          const close = this.closeOpen()
+          if (close) yield close
         }
         return
       }
