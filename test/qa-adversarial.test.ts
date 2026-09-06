@@ -408,7 +408,7 @@ test('QA-SUB-01: Regular tools (read_file, bash, edit_file) never kill or interf
     assert.ok(bridge.getActive(startPayload.runId) !== undefined, `Normal tool ${normalTools[i]} must not stop active subagent`)
   }
 
-  // 3. Subagent tool completes
+  // 3. Subagent tool completes (startup ACK)
   Array.from(mapper.map({
     kind: 'step',
     stepKey: 'step-0',
@@ -418,7 +418,12 @@ test('QA-SUB-01: Regular tools (read_file, bash, edit_file) never kill or interf
     raw: {},
   }, 10))
 
-  assert.equal(emittedEvents.length, 2)
+  assert.equal(emittedEvents.length, 1, 'invoke_subagent startup ACK must NOT emit subagent/end')
+  assert.ok(bridge.getActive(startPayload.runId) !== undefined, 'Subagent must stay active after startup ACK')
+
+  // 4. Subagent finishes execution
+  bridge.getActive(startPayload.runId)?.stop(undefined, 'Architecture approved')
+  assert.equal(emittedEvents.length, 2, 'subagent/end must be emitted upon terminal completion')
   assert.equal(emittedEvents[1]?.name, 'subagent/end')
   assert.equal(bridge.getActive(startPayload.runId), undefined, 'Subagent must unregister after completion')
   bridge.dispose()

@@ -20,6 +20,7 @@ import type { AgyEvent, RawUsage } from '../common/types.ts'
 import { mirrorCallId } from './recording.ts'
 import { buildMirrorRunCode, MIRROR_TOOL_NAME, WRAPPER_TOOL_NAME } from './mirror-tool.ts'
 import type { SubagentBridge, SubagentSession } from './subagent-bridge.ts'
+import { extractTool } from './parser.ts'
 
 const toToolCallId: (id: string) => ToolCallId =
   (dshLlm as { ToolCallId?: (id: string) => ToolCallId; CallId?: (id: string) => ToolCallId }).ToolCallId ??
@@ -210,6 +211,38 @@ export class EventMapper {
         return
       }
       if (ev.stepKind === 'thinking' || ev.stepKind === 'subagent') {
+        if (ev.stepKind === 'subagent') {
+          // Bridge step_type: "subagent" to SubagentBridge
+          const rawObj = (ev.raw && typeof ev.raw === 'object' ? ev.raw : {}) as Record<string, unknown>
+          const su = (rawObj.step_update ?? rawObj.stepUpdate) as Record<string, unknown> | undefined
+          const stepPayload = (su?.payload ?? su?.subagent ?? su ?? rawObj.payload ?? rawObj.subagent ?? rawObj) as Record<string, unknown>
+          const toolCandidate = ev.tool ?? extractTool(stepPayload) ?? (su ? extractTool(su) : undefined)
+
+          if (toolCandidate) {
+            if (toolCandidate.name === 'define_subagent' || toolCandidate.name === 'defineSubagent') {
+              this.opts.subagentBridge?.defineRole(toolCandidate.args)
+            } else if (toolCandidate.name === 'invoke_subagent' || toolCandidate.name === 'run_subagent') {
+              if (!this.activeSubagentSession) {
+                this.activeSubagentSession = this.opts.subagentBridge?.startSubagent({
+                  toolName: toolCandidate.name,
+                  toolArgs: toolCandidate.args,
+                  parentSessionId: this.opts.parentSessionId,
+                  accountHome: this.opts.accountHome,
+                  cwd: this.opts.cwd,
+                })
+              }
+            }
+          } else if (!this.activeSubagentSession && (stepPayload.Subagents || stepPayload.subagents || stepPayload.subagent_type || stepPayload.agent_type)) {
+            this.activeSubagentSession = this.opts.subagentBridge?.startSubagent({
+              toolName: 'invoke_subagent',
+              toolArgs: stepPayload,
+              parentSessionId: this.opts.parentSessionId,
+              accountHome: this.opts.accountHome,
+              cwd: this.opts.cwd,
+            })
+          }
+        }
+
         yield* this.ensureBlock('reasoning')
         if (ev.stepKind === 'thinking') {
           const prev = this.emittedByKey.get(ev.stepKey) ?? ''
@@ -260,15 +293,9 @@ export class EventMapper {
         // Only a COMPLETED step (output or error recorded) becomes a card.
         // ACTIVE envelopes arrive first with name/args only; the span waits
         // for the DONE update that carries the payload.
+        // NOTE: invoke_subagent tool output is merely an asynchronous startup ACK receipt.
+        // The background subagent session stays active; do NOT call session.stop() here.
         if (!(ev.tool.output !== undefined || ev.tool.error !== undefined)) return
-        const isSubagentTool = ev.tool.name === 'invoke_subagent' || ev.tool.name === 'run_subagent'
-        if (isSubagentTool && this.activeSubagentSession) {
-          this.activeSubagentSession.stop(
-            ev.tool.error,
-            typeof ev.tool.output === 'string' ? ev.tool.output : (ev.tool.output ? JSON.stringify(ev.tool.output) : undefined),
-          )
-          this.activeSubagentSession = undefined
-        }
         if (this.announcedTools.has(ev.stepKey)) return
         this.announcedTools.add(ev.stepKey)
         if (!this.opts.cutOnTool) return // auxiliary calls show no tool detail

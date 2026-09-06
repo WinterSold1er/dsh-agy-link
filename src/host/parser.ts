@@ -13,7 +13,18 @@ const TEXT_STEP_TYPES = new Set(['agent_text', 'agenttext', 'text', 'model_respo
 const THINKING_STEP_TYPES = new Set(['thinking', 'thought', 'reasoning'])
 const TOOL_STEP_TYPES = new Set(['tool_call', 'toolcall', 'tool', 'tool_use', 'tooluse', 'tool_run', 'toolrun', 'function_call'])
 const TITLE_STEP_TYPES = new Set(['title'])
-const SUBAGENT_STEP_TYPES = new Set(['subagent', 'subagent_message', 'subagent_result'])
+const SUBAGENT_STEP_TYPES = new Set([
+  'subagent',
+  'subagent_message',
+  'subagent_result',
+  'subagent_start',
+  'subagent_end',
+  'subagent_update',
+  'sub_agent',
+  'subagent_call',
+  'subagent_run',
+  'subagent_notification',
+])
 const USER_INPUT_STEP_TYPES = new Set(['user_input', 'userinput', 'user_message'])
 // Numeric step_type values confirmed against real conversation DBs
 // (pi-antigravity-bridge map + local agy 1.1.13 data).
@@ -102,7 +113,7 @@ function extractTextDelta(obj: Record<string, unknown>): string | undefined {
   return typeof v === 'string' ? v : undefined
 }
 
-function extractTool(obj: Record<string, unknown>): AgyToolInfo | undefined {
+export function extractTool(obj: Record<string, unknown>): AgyToolInfo | undefined {
   const info = pick(obj, ['tool_info', 'toolInfo', 'tool', 'tool_call', 'toolCall'])
   const src: Record<string, unknown> =
     info && typeof info === 'object' ? (info as Record<string, unknown>) : obj
@@ -181,7 +192,7 @@ export function classifyEvent(obj: unknown, seq: number): AgyEvent | undefined {
     const keyPart = typeof idxV === 'number' || typeof idxV === 'string' ? String(idxV) : String(seq)
     const stepKey = keyPart
     const stepKind = normalizeStepKind(pick(src, ['step_type', 'stepType', 'type']))
-    const toolInfo = stepKind === 'tool' ? extractTool(src) : undefined
+    const toolInfo = (stepKind === 'tool' || stepKind === 'subagent') ? extractTool(src) : undefined
     const delta = extractTextDelta(src)
     const text = delta !== undefined ? delta : extractText(src, stepKind)
     const stateV = pick(src, ['state'])

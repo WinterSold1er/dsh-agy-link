@@ -4,7 +4,7 @@
 // incremental transcript.jsonl steps for deep native DSH lineage & card rendering.
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 
@@ -20,8 +20,17 @@ export interface DshSessionMeta {
   [key: string]: unknown
 }
 
+export interface DshSessionHeader {
+  cwd?: string
+  delegationDepth?: number
+  parentSession?: string
+  origin?: string
+  [key: string]: unknown
+}
+
 export interface DshSession {
   readonly id: string
+  readonly header?: DshSessionHeader
   readonly meta?: DshSessionMeta
   append(type: string, data: unknown): void
 }
@@ -193,9 +202,50 @@ export class SubagentBridge {
       ? opts.toolArgs
       : {}) as Record<string, unknown>
 
-    const task = String(rawArgs.task ?? rawArgs.prompt ?? rawArgs.instruction ?? 'Subagent Task')
-    const description = String(rawArgs.description ?? rawArgs.summary ?? task)
-    const subagentType = String(rawArgs.subagent_type ?? rawArgs.agent_type ?? rawArgs.role ?? 'subagent')
+    let subagentItem: Record<string, unknown> | undefined
+    const subagentsField = rawArgs.Subagents ?? rawArgs.subagents
+    if (typeof subagentsField === 'string') {
+      try {
+        const parsed = JSON.parse(subagentsField)
+        if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'object' && parsed[0] !== null) {
+          subagentItem = parsed[0] as Record<string, unknown>
+        }
+      } catch {
+        // ignore malformed JSON string
+      }
+    } else if (Array.isArray(subagentsField) && subagentsField.length > 0 && typeof subagentsField[0] === 'object' && subagentsField[0] !== null) {
+      subagentItem = subagentsField[0] as Record<string, unknown>
+    }
+
+    const item = subagentItem ?? {}
+    const rawPrompt = item.Prompt ?? item.prompt ?? item.task ?? item.instruction ?? item.description ??
+      rawArgs.Prompt ?? rawArgs.prompt ?? rawArgs.task ?? rawArgs.instruction ?? rawArgs.description
+    const promptText = typeof rawPrompt === 'string' ? rawPrompt : ''
+
+    const promptClean = promptText.replace(/\r?\n+/g, ' ').trim()
+    const promptSummary = promptClean.length > 50
+      ? promptClean.slice(0, 48).trim() + '...'
+      : promptClean
+
+    const task = String(rawArgs.task ?? item.task ?? promptText ?? rawArgs.prompt ?? rawArgs.instruction ?? 'Subagent Task')
+    const description = String(rawArgs.description ?? rawArgs.summary ?? item.description ?? item.summary ?? (promptSummary || task))
+    const label = String(rawArgs.description ?? item.description ?? promptSummary ?? description ?? task)
+
+    const rawRole = item.subagent_type ?? item.subagentType ?? item.agent_type ?? item.role ?? item.Role ?? item.Name ?? item.name ??
+      rawArgs.subagent_type ?? rawArgs.agent_type ?? rawArgs.role
+    let subagentType = typeof rawRole === 'string' && rawRole.trim() !== '' ? rawRole.trim() : ''
+
+    if (!subagentType) {
+      const definedList = this.listRoles()
+      if (definedList.length === 1) {
+        subagentType = definedList[0]!.name
+      } else if (definedList.length > 1) {
+        const matched = definedList.find((r) => task.includes(r.name) || (r.description && task.includes(r.description)))
+        subagentType = matched ? matched.name : definedList[definedList.length - 1]!.name
+      } else {
+        subagentType = 'subagent'
+      }
+    }
 
     const runId = 'subagent-run-' + randomUUID()
     const subagentId = 'subagent-session-' + randomUUID()
@@ -209,13 +259,23 @@ export class SubagentBridge {
     if (parentSessionId && sessionsSvc?.get) {
       try {
         parentSession = sessionsSvc.get(parentSessionId)
-        if (parentSession?.meta?.delegationDepth !== undefined) {
-          delegationDepth = Number(parentSession.meta.delegationDepth) + 1
+        const parentDepth = parentSession?.header?.delegationDepth ?? parentSession?.meta?.delegationDepth
+        if (parentDepth !== undefined) {
+          delegationDepth = Number(parentDepth) + 1
         }
       } catch {
         // ignore
       }
     }
+
+    // Strict absolute cwd resolution (Defect 1)
+    const parentCwd = parentSession?.header?.cwd ?? (parentSession?.meta?.cwd as string | undefined)
+    const rawCwd = (opts.cwd && opts.cwd.trim() !== '')
+      ? opts.cwd.trim()
+      : (parentCwd && parentCwd.trim() !== '')
+      ? parentCwd.trim()
+      : process.cwd()
+    const safeCwd = isAbsolute(rawCwd) ? rawCwd : resolve(rawCwd)
 
     // 2. Create authoritative DSH sub-session
     let childSession: DshSession | undefined
@@ -226,7 +286,7 @@ export class SubagentBridge {
             origin: 'subagent',
             parentSession: parentSessionId,
             delegationDepth,
-            cwd: opts.cwd ?? (parentSession?.meta?.cwd as string | undefined),
+            cwd: safeCwd,
           },
         })
       } catch (err) {
@@ -242,7 +302,7 @@ export class SubagentBridge {
           version: 3,
           mode: 'one-shot',
           provider: 'antigravity',
-          label: description || task,
+          label: label || description || task,
         })
       } catch (err) {
         this.log?.(`Failed to append subagent descriptor to child session: ${String(err)}`)
@@ -364,6 +424,30 @@ export class SubagentBridge {
                   step: parsed,
                 })
                 appendStepToChildSession(parsed)
+
+                // Detect terminal condition from transcript (Defect 4)
+                const isTerminal =
+                  (
+                    (parsed.status === 'DONE' || parsed.status === 'COMPLETED') &&
+                    (parsed.type === 'PLANNER_RESPONSE' || parsed.type === 'agent_response' || parsed.type === 'result' || parsed.type === 'final') &&
+                    (!parsed.tool_calls || (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length === 0))
+                  ) ||
+                  parsed.event === 'result' ||
+                  parsed.type === 'result' ||
+                  parsed.status === 'ERROR'
+
+                if (isTerminal && !stopped) {
+                  const errText = parsed.status === 'ERROR'
+                    ? String(parsed.error ?? parsed.message ?? 'subagent error')
+                    : undefined
+                  const resText = typeof parsed.content === 'string'
+                    ? parsed.content
+                    : typeof parsed.response === 'string'
+                    ? parsed.response
+                    : undefined
+                  session.stop(errText, resText)
+                  return
+                }
               } catch {
                 // skip malformed line
               }
@@ -426,8 +510,15 @@ export class SubagentBridge {
               childSession.append('assistant/message', {
                 turn: 1,
                 step: stepCounter++,
+                surfaceOp: 'append',
                 message: {
+                  id: `msg-subagent-${randomUUID()}`,
                   role: 'assistant',
+                  source: {
+                    kind: 'model',
+                    provider: 'antigravity',
+                    model: 'gemini-3.8-flash',
+                  },
                   content: [{ type: 'text', text: resultText }],
                 },
               })

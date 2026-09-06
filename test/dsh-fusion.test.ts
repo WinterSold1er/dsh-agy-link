@@ -445,19 +445,23 @@ rl.on('line', (line) => {
 test('EventMapper: regular tool completion does not mistakenly kill active subagent session', () => {
   let subagentStopped = false
   let subagentError: string | undefined
+  let currentSession: { runId: string; subagentId: string; task: string; description: string; subagentType: string; startedAt: number; stop: (err?: string) => void } | undefined
   const fakeBridge = {
-    startSubagent: () => ({
-      runId: 'sub-1',
-      subagentId: 'session-1',
-      task: 'task',
-      description: 'desc',
-      subagentType: 'agent',
-      startedAt: Date.now(),
-      stop: (err?: string) => {
-        subagentStopped = true
-        subagentError = err
-      },
-    }),
+    startSubagent: () => {
+      currentSession = {
+        runId: 'sub-1',
+        subagentId: 'session-1',
+        task: 'task',
+        description: 'desc',
+        subagentType: 'agent',
+        startedAt: Date.now(),
+        stop: (err?: string) => {
+          subagentStopped = true
+          subagentError = err
+        },
+      }
+      return currentSession
+    },
   }
 
   const mapper = new EventMapper({
@@ -489,7 +493,7 @@ test('EventMapper: regular tool completion does not mistakenly kill active subag
 
   assert.equal(subagentStopped, false, 'read_file completion must NOT stop the active subagent!')
 
-  // 3. invoke_subagent tool completes
+  // 3. invoke_subagent tool completes (startup ACK) - active subagent must NOT be killed!
   Array.from(mapper.map({
     kind: 'step',
     stepKey: 'step-0',
@@ -498,7 +502,11 @@ test('EventMapper: regular tool completion does not mistakenly kill active subag
     tool: { name: 'invoke_subagent', args: { task: 'inspect' }, output: 'inspection done' }, raw: {}
   }, 2))
 
-  assert.equal(subagentStopped, true, 'invoke_subagent completion correctly stops the subagent')
+  assert.equal(subagentStopped, false, 'invoke_subagent startup ACK must NOT stop the active subagent!')
+
+  // 4. Background subagent completes via transcript
+  currentSession?.stop('inspection done')
+  assert.equal(subagentStopped, true, 'subagent transcript completion stops the subagent')
 })
 
 test('cleanOrphanMcpConfigs and writeJsonFileAtomic: cleans leftover dsh_managed__ entries', () => {

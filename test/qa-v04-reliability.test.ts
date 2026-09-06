@@ -7,7 +7,7 @@ import { defaultConfig, type AgyEvent } from '../src/common/types.ts'
 import { DEFAULT_ACTIVITY_TIMEOUT_MS } from '../src/host/runner.ts'
 import { Heartbeat } from '../src/host/heartbeat.ts'
 import { EventMapper } from '../src/host/mapper.ts'
-import { RunRegistry, parseMirrorCallId } from '../src/host/recording.ts'
+import { RunRegistry, RunRecording, parseMirrorCallId } from '../src/host/recording.ts'
 import { AgyAdapter, detectContinuation, type AgyAdapterDeps } from '../src/host/adapter.ts'
 import { SubagentBridge, type DshSession, type DshSessionManager } from '../src/host/subagent-bridge.ts'
 import { presentMirrorCall, presentMirrorResult } from '../src/host/mirror-tool.ts'
@@ -319,4 +319,145 @@ test('agy 子代理完全映射到 DSH 原生子代理: invoke_subagent 创建 D
   const turnEndEvent = appendedEvents.find((e) => e.type === 'turn/end')
   assert.ok(turnEndEvent, 'Must append turn/end event')
   assert.deepEqual((turnEndEvent.data as { reason: { kind: string } }).reason, { kind: 'completed' })
+})
+
+test('Defect 1 & 2: SubagentBridge reads parentSession.header and guarantees isAbsolute(cwd)', () => {
+  let createdMeta: { cwd?: string; delegationDepth?: number; origin?: string; parentSession?: string } | undefined
+
+  const mockSessions: DshSessionManager = {
+    get: (id: string) => {
+      if (id === 'parent-with-header') {
+        return {
+          id,
+          header: { cwd: '/home/csy/Work/twoplus', delegationDepth: 3 },
+          append: () => {},
+        }
+      }
+      return undefined
+    },
+    create: (id, options) => {
+      createdMeta = options?.meta as typeof createdMeta
+      return {
+        id: id ?? 'sub-sess',
+        append: () => {},
+      }
+    },
+  }
+
+  const bridge = new SubagentBridge({ sessions: mockSessions })
+
+  // 1. When cwd is empty string, fall back to parentSession.header.cwd
+  bridge.startSubagent({
+    toolName: 'invoke_subagent',
+    toolArgs: { task: 'Analyze topology' },
+    parentSessionId: 'parent-with-header',
+    cwd: '',
+  })
+
+  assert.ok(createdMeta)
+  assert.equal(createdMeta.delegationDepth, 4, 'Must increment header.delegationDepth')
+  assert.equal(createdMeta.cwd, '/home/csy/Work/twoplus', 'Must fall back to header.cwd when cwd is empty string')
+  assert.ok(createdMeta.cwd.startsWith('/'), 'Must be an absolute path')
+
+  // 2. When cwd is a relative path, resolve to absolute
+  bridge.startSubagent({
+    toolName: 'invoke_subagent',
+    toolArgs: { task: 'Analyze relative path' },
+    cwd: 'relative/sub/dir',
+  })
+
+  assert.ok(createdMeta)
+  assert.ok(createdMeta.cwd?.startsWith('/'), 'Relative path must be resolved to absolute path')
+})
+
+test('Defect 3: SubagentBridge parses agy native { Subagents: "[{\\"Model\\":...,\\"Prompt\\":...}]" } and synthesizes label', () => {
+  let createdDesc: { version: number; mode: string; provider: string; label: string } | undefined
+  const appended: Array<{ type: string; data: unknown }> = []
+
+  const mockSessions: DshSessionManager = {
+    create: (id) => ({
+      id: id ?? 'sub-sess',
+      append: (type, data) => {
+        appended.push({ type, data })
+        if (type === 'subagent/descriptor') {
+          createdDesc = data as typeof createdDesc
+        }
+      },
+    }),
+  }
+
+  const bridge = new SubagentBridge({ sessions: mockSessions })
+  // Define role beforehand
+  bridge.defineRole({ name: 'vnm_gui_specialist', description: 'VNM specialist' })
+
+  // Long prompt simulating agy native payload
+  const nativeSubagentsJson = JSON.stringify([
+    {
+      Model: 'inherit',
+      Prompt: '接力继续执行并彻底完成 vnm_gui 首页纯净拓扑改造、拓扑图美化与标签完整展示、Sim 环境联调与 Tauri MCP 全页面截图验证任务。\n\n【前序进展与关键上下文】\n1. 本地仓库：/home/csy/Work/vnm_gui',
+    },
+  ])
+
+  const session = bridge.startSubagent({
+    toolName: 'invoke_subagent',
+    toolArgs: {
+      Subagents: nativeSubagentsJson,
+    },
+  })
+
+  assert.equal(session.subagentType, 'vnm_gui_specialist', 'Must inherit defined role when subagent_type omitted in item')
+  assert.ok(createdDesc, 'Must append subagent/descriptor')
+  assert.equal(createdDesc.version, 3)
+  assert.equal(createdDesc.mode, 'one-shot')
+  assert.equal(createdDesc.provider, 'antigravity')
+  assert.ok(createdDesc.label.length <= 55, 'Label must be truncated to concise 40~50 chars')
+  assert.ok(createdDesc.label.includes('接力继续执行并彻底完成 vnm_gui 首页纯净拓扑改造'), 'Label must capture prompt start')
+})
+
+test('Defect 5: EventMapper bridges step_type: "subagent" to SubagentBridge', () => {
+  let subagentStarted = false
+  let receivedArgs: unknown
+
+  const fakeBridge = {
+    startSubagent: (opts: { toolArgs?: unknown }) => {
+      subagentStarted = true
+      receivedArgs = opts.toolArgs
+      return {
+        runId: 'sub-run',
+        subagentId: 'sub-sess',
+        task: 'task',
+        description: 'desc',
+        subagentType: 'subagent',
+        startedAt: Date.now(),
+        stop: () => {},
+      }
+    },
+  }
+
+  const mapper = new EventMapper({
+    cutOnTool: false,
+    runId: 'run-1',
+    usage: new RunRecording(),
+    subagentBridge: fakeBridge as never,
+  })
+
+  // agy emits step_update with step_type: subagent and payload
+  Array.from(mapper.map({
+    kind: 'step',
+    stepKey: 'step-sub',
+    stepKind: 'subagent',
+    text: 'analyzing',
+    raw: {
+      step_update: {
+        step_type: 'subagent',
+        payload: {
+          subagent_type: 'security_auditor',
+          task: 'Scan open ports',
+        },
+      },
+    },
+  }, 0))
+
+  assert.equal(subagentStarted, true, 'step_type: "subagent" must trigger subagentBridge.startSubagent')
+  assert.deepEqual(receivedArgs, { subagent_type: 'security_auditor', task: 'Scan open ports' })
 })

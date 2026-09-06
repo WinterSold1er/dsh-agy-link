@@ -5,7 +5,7 @@
 // multi-turn continuity (ADR-4). Only the trailing user messages become the
 // prompt; earlier context rides agy-native history plus a digest prefix on
 // first bind (ADR-7).
-import { join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { LlmAdapter, LlmError, type GenerateOptions, type LlmModelInfo, type LlmProviderInfo, type LlmResolvedModelInfo, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { Err, looksLikeAuthFailure, looksLikeHardRateLimit, looksLikeRateLimit, PROVIDER_ID, type PluginConfig } from '../common/types.ts'
 import { modelFamilyOf } from '../common/pool-types.ts'
@@ -347,10 +347,10 @@ export class AgyAdapter extends LlmAdapter {
     // 'skip' that is a silent wrong-workspace write path, so log it loudly
     // once per session instead of failing the turn.
     let workspaceRoot = cfg.workspaceRoot
-    if (workspaceRoot === '') {
+    if (!workspaceRoot || workspaceRoot.trim() === '') {
       const fromSession = sessionKey !== '' ? this.deps.sessionCwd?.(sessionKey) : undefined
-      if (fromSession) {
-        workspaceRoot = fromSession
+      if (fromSession && fromSession.trim() !== '') {
+        workspaceRoot = fromSession.trim()
       } else {
         workspaceRoot = process.cwd()
         this.warnOnce(
@@ -358,6 +358,9 @@ export class AgyAdapter extends LlmAdapter {
           'session workspace unresolved (sessionId=' + (sessionKey || 'none') + ') — running agy in the DSH process cwd: ' + workspaceRoot,
         )
       }
+    }
+    if (!isAbsolute(workspaceRoot)) {
+      workspaceRoot = resolve(workspaceRoot)
     }
 
     // ---- native tool mirroring: continuation spans (v0.3) ----
@@ -383,7 +386,7 @@ export class AgyAdapter extends LlmAdapter {
         this.deps.runs.markActive(rec.runId, true)
         let isWaitingForNextTool = false
         try {
-          for await (const ch of this.driveSpan(rec, cursor, true, isCodeMode, sessionKey, undefined, cfg.workspaceRoot)) {
+          for await (const ch of this.driveSpan(rec, cursor, true, isCodeMode, sessionKey, undefined, workspaceRoot)) {
             if (ch.type === 'finish' && ch.reason.kind === 'tool-calls') {
               isWaitingForNextTool = true
             }
@@ -969,6 +972,8 @@ export class AgyAdapter extends LlmAdapter {
     accountHome?: string,
     cwd?: string,
   ): AsyncIterable<StreamChunk> {
+    const rawCwd = (cwd && cwd.trim() !== '') ? cwd.trim() : process.cwd()
+    const safeCwd = isAbsolute(rawCwd) ? rawCwd : resolve(rawCwd)
     const queue = new ChunkQueue()
     void (async () => {
       const mapper = new EventMapper({
@@ -980,7 +985,7 @@ export class AgyAdapter extends LlmAdapter {
         subagentBridge: this.deps.subagentBridge,
         parentSessionId: parentSessionId !== '' ? parentSessionId : undefined,
         accountHome,
-        cwd,
+        cwd: safeCwd,
       })
 
       const heartbeat = new Heartbeat({
