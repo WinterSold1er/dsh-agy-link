@@ -204,6 +204,7 @@ test('DaemonToolFacade: implements InternalTool contract and dispatches actions'
       id: 'facade-daemon',
       command: process.execPath,
       args: ['-e', 'console.log("HELLO_DAEMON"); setInterval(() => {}, 1000)'],
+      readyPattern: 'HELLO_DAEMON',
     })) as { ok: boolean; id: string; pid: number; status: string }
 
     assert.equal(startRes.ok, true)

@@ -347,7 +347,7 @@ export class AgyAdapter extends LlmAdapter {
       throw new LlmError('auxiliary calls are disabled for the antigravity route (allowAuxiliary: false)', Err.AUX_DISABLED)
     }
     const isCodeMode = options.tools ? options.tools.some((t) => t.name === 'run_code') : false
-    const sessionKey = options.sessionId !== undefined ? String(options.sessionId) : ''
+    const sessionKey = options.sessionId != null ? String(options.sessionId).trim() : ''
     // cwd precedence: explicit config > the DSH session's own workspace >
     // the host process cwd. The last fallback can land agy in an UNRELATED
     // directory (wherever the DSH server was started) — with permissionMode
@@ -392,8 +392,9 @@ export class AgyAdapter extends LlmAdapter {
       } else {
         this.deps.runs.markActive(rec.runId, true)
         let isWaitingForNextTool = false
+        const contModel = options.model ? resolveModelSlug(options.model) : undefined
         try {
-          for await (const ch of this.driveSpan(rec, cursor, true, isCodeMode, sessionKey, undefined, workspaceRoot)) {
+          for await (const ch of this.driveSpan(rec, cursor, true, isCodeMode, sessionKey, undefined, workspaceRoot, contModel)) {
             if (ch.type === 'finish' && ch.reason.kind === 'tool-calls') {
               isWaitingForNextTool = true
             }
@@ -741,6 +742,9 @@ export class AgyAdapter extends LlmAdapter {
             http_proxy: account.proxyUrl,
           }
         : {}),
+      ...(sessionKey !== '' ? { DSH_SESSION_ID: sessionKey } : {}),
+      ...(workspaceRoot ? { DSH_WORKSPACE_CWD: workspaceRoot } : {}),
+      ...(rec?.runId ? { DSH_RUN_ID: rec.runId } : {}),
     }
 
     // Per-account burst spacing throttle with randomized jitter (prevents high-frequency flood to Google endpoints)
@@ -958,7 +962,7 @@ export class AgyAdapter extends LlmAdapter {
     // completed tool step cuts it (or the result finishes it).
     let isWaitingForTool = false
     try {
-      for await (const ch of this.driveSpan(rec, 0, !isAux, isCodeMode, sessionKey, account?.dir, workspaceRoot)) {
+      for await (const ch of this.driveSpan(rec, 0, !isAux, isCodeMode, sessionKey, account?.dir, workspaceRoot, effectiveModel)) {
         if (ch.type === 'finish' && ch.reason.kind === 'tool-calls') {
           isWaitingForTool = true
         }
@@ -986,6 +990,7 @@ export class AgyAdapter extends LlmAdapter {
     parentSessionId?: string,
     accountHome?: string,
     cwd?: string,
+    model?: string,
   ): AsyncIterable<StreamChunk> {
     const rawCwd = (cwd && cwd.trim() !== '') ? cwd.trim() : process.cwd()
     const safeCwd = isAbsolute(rawCwd) ? rawCwd : resolve(rawCwd)
@@ -1001,6 +1006,7 @@ export class AgyAdapter extends LlmAdapter {
         parentSessionId: parentSessionId !== '' ? parentSessionId : undefined,
         accountHome,
         cwd: safeCwd,
+        model,
       })
 
       const heartbeat = new Heartbeat({

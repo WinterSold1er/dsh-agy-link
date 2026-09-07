@@ -10,6 +10,8 @@ import { createInterface } from 'node:readline'
 const URL_BASE = process.env.DSH_MCP_URL || ''
 const TOKEN = process.env.DSH_MCP_TOKEN || ''
 const PROTOCOL = '2024-11-05'
+const SESSION_ID = process.env.DSH_SESSION_ID || ''
+const WORKSPACE_CWD = process.env.DSH_WORKSPACE_CWD || ''
 
 function post(path, body) {
   return new Promise((resolve, reject) => {
@@ -19,16 +21,27 @@ function post(path, body) {
     }
     const data = JSON.stringify(body)
     const u = new URL(URL_BASE)
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(data),
+      Authorization: 'Bearer ' + TOKEN,
+    }
+    if (SESSION_ID) {
+      try {
+        headers['X-Dsh-Session-Id'] = encodeURIComponent(SESSION_ID)
+      } catch {}
+    }
+    if (WORKSPACE_CWD) {
+      try {
+        headers['X-Dsh-Workspace-Cwd'] = encodeURIComponent(WORKSPACE_CWD)
+      } catch {}
+    }
     const req = httpRequest({
       hostname: u.hostname,
       port: u.port || 80,
       method: 'POST',
       path,
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-        Authorization: 'Bearer ' + TOKEN,
-      },
+      headers,
       timeout: 600000,
     });
     req.on('response', (res) => {
@@ -49,18 +62,35 @@ function post(path, body) {
 }
 
 let toolCache = null;
+let toolCacheTime = 0;
+const TOOL_CACHE_TTL_MS = 2000;
+let pendingListTools = null;
+let lastCacheMissInvalidation = 0;
+const CACHE_MISS_COOLDOWN_MS = 1000;
 
-async function listTools() {
-  if (toolCache) return toolCache;
-  const res = await post('/tools', {})
-  if (res.status !== 200) throw new Error('bridge /tools failed: ' + JSON.stringify(res.body))
-  toolCache = (res.body.tools || []).map((t) => ({
-    name: t.name,
-    description: t.description || t.dshName,
-    inputSchema: t.inputSchema || { type: 'object' },
-    _dshName: t.dshName,
-  }))
-  return toolCache;
+async function listTools(force = false) {
+  const now = Date.now();
+  if (!force && toolCache && (now - toolCacheTime < TOOL_CACHE_TTL_MS)) return toolCache;
+  if (pendingListTools) return pendingListTools;
+
+  pendingListTools = (async () => {
+    try {
+      const res = await post('/tools', { sessionId: SESSION_ID, cwd: WORKSPACE_CWD })
+      if (res.status !== 200) throw new Error('bridge /tools failed: ' + JSON.stringify(res.body))
+      toolCache = (res.body.tools || []).map((t) => ({
+        name: t.name,
+        description: t.description || t.dshName,
+        inputSchema: t.inputSchema || { type: 'object' },
+        _dshName: t.dshName,
+      }))
+      toolCacheTime = Date.now();
+      return toolCache;
+    } finally {
+      pendingListTools = null;
+    }
+  })();
+
+  return pendingListTools;
 }
 
 function send(msg) {
@@ -81,14 +111,26 @@ async function handle(id, method, params) {
   if (method === 'tools/call') {
     const name = params && params.name
     const args = (params && params.arguments) || {}
-    const tools = await listTools()
-    const hit = tools.find((t) => t.name === name)
+    let tools = await listTools()
+    let hit = tools.find((t) => t.name === name)
+    const now = Date.now()
+    if (!hit && toolCache && (now - lastCacheMissInvalidation >= CACHE_MISS_COOLDOWN_MS)) {
+      lastCacheMissInvalidation = now;
+      toolCache = null;
+      tools = await listTools(true)
+      hit = tools.find((t) => t.name === name)
+    }
     if (!hit) {
       send({ jsonrpc: '2.0', id, error: { code: -32602, message: 'unknown tool: ' + name } })
       return;
     }
     try {
-      const res = await post('/call', { dshName: hit._dshName, arguments: args })
+      const res = await post('/call', {
+        dshName: hit._dshName,
+        arguments: args,
+        sessionId: SESSION_ID,
+        cwd: WORKSPACE_CWD,
+      })
       if (res.status !== 200 || res.body.ok !== true) {
         send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'ERROR: ' + JSON.stringify(res.body) }], isError: true } })
         return;

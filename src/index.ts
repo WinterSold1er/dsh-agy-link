@@ -5,7 +5,7 @@
 // cleanly.
 import type { Context } from '@deepseek-ai/cordis'
 import { execFile } from 'node:child_process'
-import { join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { dshHome, overridesPath, readOverrides, resolveConfig, stateDir } from './common/config.ts'
 import { PLUGIN_ID, PROVIDER_ID, type PluginConfig } from './common/types.ts'
@@ -25,7 +25,7 @@ import { PoolAuthFlow } from './host/pool-auth.ts'
 import { QuotaService } from './host/quota.ts'
 import { StreamJsonParser } from './host/parser.ts'
 import { defaultMediaDir, sweepDir, type ImageRefLike } from './host/media.ts'
-import { startMcpBridge, writeMcpConfig, shadowMergeGeminiMcpConfig, cleanOrphanMcpConfigs, type McpBridge, type ToolsServiceLike } from './host/mcp-bridge.ts'
+import { startMcpBridge, writeMcpConfig, shadowMergeGeminiMcpConfig, cleanOrphanMcpConfigs, type McpBridge, type ToolsServiceLike, type SessionToolsProvider, type SessionContextHint, type ToolsView } from './host/mcp-bridge.ts'
 import { scanAndStageSkills } from './host/skills-bridge.ts'
 import { SubagentBridge, type SubagentBridgeContext } from './host/subagent-bridge.ts'
 import { ProcessManager } from './host/process-manager.ts'
@@ -70,6 +70,118 @@ class Semaphore {
     this.active--
     const next = this.queue.shift()
     if (next) next()
+  }
+}
+
+/**
+ * Session-scoped tools provider: resolves tools for the requesting agent session
+ * so that session-scoped MCP tools (like vectr tools registered in agent.ctx.tools)
+ * can be discovered and executed through the reverse bridge.
+ */
+export class DshSessionToolsProvider implements SessionToolsProvider {
+  constructor(private readonly ctx: Context) {}
+
+  private isAgentAlive(a: unknown): boolean {
+    if (!a || typeof a !== 'object') return false
+    const agent = a as { disposed?: boolean; ctx?: { isDisposed?: boolean } }
+    if (agent.disposed === true || agent.ctx?.isDisposed === true) {
+      return false
+    }
+    return true
+  }
+
+  private findAgent(hint?: SessionContextHint): unknown {
+    const agentsSvc = this.ctx.get('agents') as
+      | { get?: (id: string) => unknown; list?: () => Iterable<unknown> }
+      | undefined
+    if (!agentsSvc) return undefined
+
+    const rawSessionId = hint?.sessionId != null ? String(hint.sessionId).trim() : ''
+    const rawCwd = hint?.cwd != null ? String(hint.cwd).trim() : ''
+
+    // 1. SessionId match (priority)
+    if (rawSessionId !== '') {
+      if (typeof agentsSvc.get === 'function') {
+        const a = agentsSvc.get(rawSessionId)
+        if (this.isAgentAlive(a)) return a
+      }
+      if (typeof agentsSvc.list === 'function') {
+        try {
+          const list = agentsSvc.list()
+          if (list) {
+            for (const a of list as Iterable<any>) {
+              if (!this.isAgentAlive(a)) continue
+              if (a && (a.id === rawSessionId || a.session?.id === rawSessionId)) {
+                return a
+              }
+            }
+          }
+        } catch {}
+      }
+      // Provided sessionId but did not match any alive agent:
+      // Strictly do not fall back to cwd matching; return undefined (fallback to root view).
+      return undefined
+    }
+
+    // 2. Cwd match (fallback ONLY when !hint?.sessionId)
+    if (rawCwd !== '' && typeof agentsSvc.list === 'function') {
+      try {
+        const targetCwd = resolve(rawCwd)
+        const list = agentsSvc.list()
+        if (list) {
+          const matched: any[] = []
+          for (const a of list as Iterable<any>) {
+            if (!this.isAgentAlive(a)) continue
+            const aCwd = a.session?.header?.cwd ?? a.session?.meta?.cwd ?? a.session?.cwd
+            if (typeof aCwd === 'string' && aCwd.trim() !== '') {
+              if (resolve(aCwd) === targetCwd) {
+                matched.push(a)
+              }
+            }
+          }
+          // Must ensure EXACTLY ONE alive agent matches the cwd.
+          // If multiple agents match the same cwd, abort fallback to prevent cross-session hijacking.
+          if (matched.length === 1) {
+            return matched[0]
+          }
+        }
+      } catch {}
+    }
+
+    return undefined
+  }
+
+  resolveToolsView(hint?: SessionContextHint): ToolsView | undefined {
+    const toolsSvc = this.ctx.get('tools') as
+      | { schemas?: (scope?: unknown) => any[]; execute?: (input: any) => Promise<unknown> }
+      | undefined
+    if (!toolsSvc) return undefined
+
+    const agent = this.findAgent(hint)
+
+    return {
+      schemas: () => {
+        if (agent && typeof toolsSvc.schemas === 'function') {
+          try {
+            return toolsSvc.schemas(agent)
+          } catch {
+            return toolsSvc.schemas()
+          }
+        }
+        return typeof toolsSvc.schemas === 'function' ? toolsSvc.schemas() : []
+      },
+      execute: async (input: { callId: string; name: string; arguments: unknown; signal?: AbortSignal }) => {
+        if (typeof toolsSvc.execute !== 'function') {
+          throw new Error('tools service execute unavailable')
+        }
+        const execInput = {
+          ...input,
+          ...(agent ? { agent } : {}),
+          signal: (input as any).signal ?? new AbortController().signal,
+        }
+        return toolsSvc.execute(execInput)
+      },
+    }
   }
 }
 
@@ -777,8 +889,10 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           // (URL.pathname would yield /C:/... there and break the spawn).
           const script = resolveBridgeScript()
           const toolsSvc = ctx.get('tools') as ToolsServiceLike | undefined
+          const toolsProvider = new DshSessionToolsProvider(ctx)
           const bridge = await startMcpBridge({
             bridgeScript: script,
+            toolsProvider,
             tools: () => (ctx.get('tools') as ToolsServiceLike | undefined),
             internalTools: () => [daemonTool],
             allowlist: () => getConfig().mcpToolAllowlist,

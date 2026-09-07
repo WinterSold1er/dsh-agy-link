@@ -816,6 +816,19 @@ test('sliding-window rate limit enforces request throttling per minute', async (
   assert.ok(elapsed < 5000, `elapsed ${elapsed}ms exceeded 5000ms`)
 })
 
+test('sessionId: null or undefined does not stringify to "null"', async () => {
+  let queriedSessionId: string | null = null
+  const { adapter } = makeAdapter({}, {
+    sessionCwd: (id) => {
+      queriedSessionId = id
+      return undefined
+    },
+  })
+  process.env.FAKE_AGY_MODE = 'ok'
+  await collect(adapter.stream(opts([msg('user', 'hi')], { sessionId: null as never })))
+  assert.equal(queriedSessionId, null, 'sessionCwd should not be called with "null" string')
+})
+
 test.after(() => {
   rmSync(workDir, { recursive: true, force: true })
 })

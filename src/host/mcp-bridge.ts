@@ -65,11 +65,22 @@ export interface InternalTool {
   execute(args: Record<string, unknown>): Promise<unknown>
 }
 
-/** Minimal structural view of the DSH tool registry we need. */
-export interface ToolsServiceLike {
-  schemas(): Array<{ name: string; description: string; parameters: Record<string, unknown> }>
-  execute(input: { callId: string; name: string; arguments: unknown }): Promise<unknown>
+export interface SessionContextHint {
+  sessionId?: string
+  cwd?: string
 }
+
+export interface ToolsView {
+  schemas(): Array<{ name: string; description: string; parameters: Record<string, unknown> }>
+  execute(input: { callId: string; name: string; arguments: unknown; signal?: AbortSignal }): Promise<unknown>
+}
+
+export interface SessionToolsProvider {
+  resolveToolsView(hint?: SessionContextHint): ToolsView | undefined
+}
+
+/** Minimal structural view of the DSH tool registry we need. Kept for backwards compatibility. */
+export type ToolsServiceLike = ToolsView
 
 /**
  * MCP tool names are [a-zA-Z0-9_-]; DSH names may contain dots or other characters.
@@ -100,12 +111,32 @@ export interface McpBridge {
   close(): Promise<void>
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve) => {
+export class PayloadTooLargeError extends Error {
+  constructor(message = 'Payload Too Large') {
+    super(message)
+    this.name = 'PayloadTooLargeError'
+  }
+}
+
+const MAX_BODY_BYTES = 10 * 1024 * 1024 // 10MB
+
+function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let size = 0
     const chunks: Buffer[] = []
-    req.on('data', (c: Buffer) => chunks.push(c))
+    function onData(c: Buffer) {
+      size += c.length
+      if (size > maxBytes) {
+        req.removeListener('data', onData)
+        req.pause()
+        reject(new PayloadTooLargeError())
+        return
+      }
+      chunks.push(c)
+    }
+    req.on('data', onData)
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
-    req.on('error', () => resolve(''))
+    req.on('error', (err) => reject(err))
   })
 }
 
@@ -138,10 +169,39 @@ function resultText(result: unknown): string {
 
 export interface BridgeOptions {
   bridgeScript: string
-  tools: () => ToolsServiceLike | undefined
+  toolsProvider?: SessionToolsProvider
+  tools?: () => ToolsServiceLike | undefined
   internalTools?: () => InternalTool[]
   allowlist: () => string
   log?: (msg: string) => void
+}
+
+function safeDecode(val: unknown): string | undefined {
+  if (typeof val !== 'string') return undefined
+  const trimmed = val.trim()
+  if (trimmed === '') return undefined
+  try {
+    return decodeURIComponent(trimmed)
+  } catch {
+    return trimmed
+  }
+}
+
+function extractHint(req: IncomingMessage, bodyObj?: Record<string, unknown>): SessionContextHint {
+  const rawBodySessionId =
+    typeof bodyObj?.sessionId === 'string' && bodyObj.sessionId.trim() !== '' ? bodyObj.sessionId.trim() : undefined
+  const rawBodyCwd =
+    typeof bodyObj?.cwd === 'string' && bodyObj.cwd.trim() !== '' ? bodyObj.cwd.trim() : undefined
+
+  const hSessionId = req.headers['x-dsh-session-id']
+  const hCwd = req.headers['x-dsh-workspace-cwd']
+  const headerSessionId = Array.isArray(hSessionId) ? hSessionId[0] : hSessionId
+  const headerCwd = Array.isArray(hCwd) ? hCwd[0] : hCwd
+
+  const sessionId = rawBodySessionId ?? safeDecode(headerSessionId)
+  const cwd = rawBodyCwd ?? safeDecode(headerCwd)
+
+  return { sessionId, cwd }
 }
 
 /**
@@ -160,7 +220,30 @@ export function startMcpBridge(opts: BridgeOptions): Promise<McpBridge> {
         return
       }
       if ((req.method === 'GET' || req.method === 'POST') && (url === '/tools' || url === '/mcp/tools')) {
-        const svc = opts.tools()
+        let bodyObj: Record<string, unknown> | undefined
+        if (req.method === 'POST') {
+          let bodyText = ''
+          try {
+            bodyText = await readBody(req)
+          } catch (err) {
+            if (err instanceof PayloadTooLargeError) {
+              sendJson(res, 413, { error: 'payload too large' })
+              return
+            }
+            sendJson(res, 400, { error: 'bad request' })
+            return
+          }
+          if (bodyText.trim() !== '') {
+            try {
+              const p = JSON.parse(bodyText)
+              if (p && typeof p === 'object' && !Array.isArray(p)) {
+                bodyObj = p as Record<string, unknown>
+              }
+            } catch {}
+          }
+        }
+        const hint = extractHint(req, bodyObj)
+        const svc = opts.toolsProvider?.resolveToolsView(hint) ?? opts.tools?.()
         const internal = opts.internalTools ? opts.internalTools() : []
         if (!svc && internal.length === 0) {
           sendJson(res, 503, { error: 'tools service unavailable' })
@@ -210,14 +293,35 @@ export function startMcpBridge(opts: BridgeOptions): Promise<McpBridge> {
         return;
       }
       if (req.method === 'POST' && (url === '/call' || url === '/mcp/call')) {
-        const body = await readBody(req)
-        let parsed: { dshName?: unknown; name?: unknown; arguments?: unknown } = {}
+        let body = ''
+        try {
+          body = await readBody(req)
+        } catch (err) {
+          if (err instanceof PayloadTooLargeError) {
+            sendJson(res, 413, { error: 'payload too large' })
+            return
+          }
+          sendJson(res, 400, { error: 'bad request' })
+          return
+        }
+        let parsed: { dshName?: unknown; name?: unknown; arguments?: unknown; sessionId?: unknown; cwd?: unknown }
         try {
           parsed = JSON.parse(body) as typeof parsed
         } catch {
           sendJson(res, 400, { error: 'invalid JSON' })
           return
         }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          sendJson(res, 400, { error: 'invalid JSON: expected object' })
+          return
+        }
+
+        const ac = new AbortController()
+        const abortIfOpen = () => {
+          if (!res.writableEnded) ac.abort()
+        }
+        req.on('close', abortIfOpen)
+        res.on('close', abortIfOpen)
 
         let targetName = typeof parsed.dshName === 'string' ? parsed.dshName : ''
         const rawName = typeof (parsed as { name?: unknown }).name === 'string' ? (parsed as { name: string }).name : ''
@@ -249,7 +353,8 @@ export function startMcpBridge(opts: BridgeOptions): Promise<McpBridge> {
         }
 
         // 2. Regular DSH ToolsService forwarding
-        const svc = opts.tools()
+        const hint = extractHint(req, parsed as Record<string, unknown>)
+        const svc = opts.toolsProvider?.resolveToolsView(hint) ?? opts.tools?.()
         if (!svc) {
           sendJson(res, 503, { error: 'tools service unavailable' })
           return
@@ -268,9 +373,21 @@ export function startMcpBridge(opts: BridgeOptions): Promise<McpBridge> {
           sendJson(res, 400, { error: 'bad tool name' })
           return;
         }
+
+        const allow = opts.allowlist().split(',').map((s) => s.trim()).filter(Boolean)
+        if (allow.length > 0 && !allow.includes(dshName)) {
+          sendJson(res, 403, { ok: false, error: `tool "${dshName}" not permitted by allowlist` })
+          return
+        }
+
         callSeq++
         try {
-          const result = await svc.execute({ callId: 'agy-mcp-' + callSeq, name: dshName, arguments: parsed.arguments ?? {} })
+          const result = await svc.execute({
+            callId: 'agy-mcp-' + callSeq,
+            name: dshName,
+            arguments: parsed.arguments ?? {},
+            signal: ac.signal,
+          })
           sendJson(res, 200, { ok: true, text: resultText(result) })
         } catch (e) {
           sendJson(res, 200, { ok: false, error: String(e) })
@@ -366,17 +483,7 @@ export function geminiMcpConfigPath(baseHome?: string): string {
 export function discoverDshMcpServers(dshHomeDir = dshHome()): Record<string, McpServerConfig> {
   const servers: Record<string, McpServerConfig> = {}
 
-  // 1. Check for Vectr on host dynamically via ~/.local/bin and system PATH
-  const vectrCli = findExecutable('vectr')
-  const hasVectrJson = existsSync(join(dshHomeDir, 'vectr-codebases.json'))
-  if (vectrCli || hasVectrJson) {
-    servers['vectr'] = {
-      command: vectrCli ?? 'vectr',
-      args: ['mcp-stdio'],
-    }
-  }
-
-  // 2. Parse DSH cordis.patch.yml files for @deepseek-ai/dsh-mcp-client entries
+  // Parse DSH cordis.patch.yml files for @deepseek-ai/dsh-mcp-client entries
   const candidatePatchFiles = [
     join(dshHomeDir, 'profiles', 'web', 'cordis.patch.yml'),
     join(dshHomeDir, 'cordis.patch.yml'),

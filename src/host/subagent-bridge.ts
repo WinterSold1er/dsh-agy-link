@@ -3,10 +3,12 @@
 // DSH child sessions with authoritative `subagent/descriptor` metadata, and streams
 // incremental transcript.jsonl steps for deep native DSH lineage & card rendering.
 
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { StringDecoder } from 'node:string_decoder'
 
 export interface SubagentEventEmitter {
   emit(event: string, ...args: unknown[]): void
@@ -84,12 +86,42 @@ export interface SubagentStepInfo {
 export interface SubagentSession {
   readonly runId: string
   readonly subagentId: string
+  readonly conversationId?: string
+  readonly logAbsoluteUri?: string
   readonly childSession?: DshSession
   readonly task: string
   readonly description: string
   readonly subagentType: string
   readonly startedAt: number
+  readonly isStopped: boolean
+  bindLogUri(uri: string, conversationId?: string): void
   stop(error?: string, resultText?: string): void
+}
+
+export interface StartSubagentOptions {
+  toolName: string
+  toolArgs?: unknown
+  conversationId?: string
+  logAbsoluteUri?: string
+  parentSessionId?: string
+  accountHome?: string
+  cwd?: string
+  model?: string
+  stepKey?: string
+  onStep?: (step: Record<string, unknown>) => void
+  onStop?: (session: SubagentSession, error?: string, resultText?: string) => void
+}
+
+/** Converts file:// URI or plain path to local absolute file path. */
+export function uriToPath(uri: string): string {
+  if (uri.startsWith('file://')) {
+    try {
+      return fileURLToPath(uri)
+    } catch {
+      return uri.replace(/^file:\/\//, '')
+    }
+  }
+  return uri
 }
 
 /** Resolves brain directory where agy writes subagent transcripts. */
@@ -105,6 +137,9 @@ export function defaultBrainDir(accountHome?: string): string {
 export class SubagentBridge {
   private readonly definedRoles = new Map<string, SubagentRoleDefinition>()
   private readonly activeSubagents = new Map<string, SubagentSession>()
+  private readonly sessionsByStepKey = new Map<string, SubagentSession>()
+  private readonly sessionsByConversationId = new Map<string, SubagentSession>()
+  private readonly claimedTranscriptPaths = new Set<string>()
   private readonly emitter?: SubagentEventEmitter
   private readonly sessions?: DshSessionManager
   private readonly ctx?: SubagentBridgeContext | SubagentEventEmitter
@@ -186,18 +221,10 @@ export class SubagentBridge {
   }
 
   /**
-   * Start a subagent session when agy calls invoke_subagent.
-   * Creates a native DSH child session, writes subagent/descriptor,
-   * emits lifecycle events, and tails transcript.jsonl.
+   * Get existing active subagent session or start a new one.
+   * Performs global deduplication by conversationId and stepKey.
    */
-  startSubagent(opts: {
-    toolName: string
-    toolArgs?: unknown
-    parentSessionId?: string
-    accountHome?: string
-    cwd?: string
-    onStep?: (step: Record<string, unknown>) => void
-  }): SubagentSession {
+  getOrStartSubagent(opts: StartSubagentOptions & { stepKey?: string }): SubagentSession {
     const rawArgs = (opts.toolArgs && typeof opts.toolArgs === 'object'
       ? opts.toolArgs
       : {}) as Record<string, unknown>
@@ -221,6 +248,43 @@ export class SubagentBridge {
     const rawPrompt = item.Prompt ?? item.prompt ?? item.task ?? item.instruction ?? item.description ??
       rawArgs.Prompt ?? rawArgs.prompt ?? rawArgs.task ?? rawArgs.instruction ?? rawArgs.description
     const promptText = typeof rawPrompt === 'string' ? rawPrompt : ''
+
+    // Deduplication check:
+    // 1. By conversationId
+    const itemCid = (typeof item.conversationId === 'string' ? item.conversationId : undefined) ??
+      (typeof item.conversation_id === 'string' ? item.conversation_id : undefined) ??
+      (typeof rawArgs.conversationId === 'string' ? rawArgs.conversationId : undefined) ??
+      (typeof rawArgs.conversation_id === 'string' ? rawArgs.conversation_id : undefined)
+    const effectiveConvId = opts.conversationId ?? itemCid
+
+    if (effectiveConvId) {
+      const existingByConv = this.sessionsByConversationId.get(effectiveConvId)
+      if (existingByConv) {
+        if (opts.logAbsoluteUri) {
+          existingByConv.bindLogUri(opts.logAbsoluteUri, effectiveConvId)
+        }
+        if (opts.stepKey) {
+          this.sessionsByStepKey.set(opts.stepKey, existingByConv)
+        }
+        return existingByConv
+      }
+    }
+
+    // 2. By stepKey
+    if (opts.stepKey) {
+      const existingByStep = this.sessionsByStepKey.get(opts.stepKey)
+      if (existingByStep) {
+        if (effectiveConvId) {
+          existingByStep.bindLogUri(opts.logAbsoluteUri ?? existingByStep.logAbsoluteUri ?? '', effectiveConvId)
+        } else if (opts.logAbsoluteUri) {
+          existingByStep.bindLogUri(opts.logAbsoluteUri)
+        }
+        if (effectiveConvId && !this.sessionsByConversationId.has(effectiveConvId)) {
+          this.sessionsByConversationId.set(effectiveConvId, existingByStep)
+        }
+        return existingByStep
+      }
+    }
 
     const promptClean = promptText.replace(/\r?\n+/g, ' ').trim()
     const promptSummary = promptClean.length > 50
@@ -247,8 +311,19 @@ export class SubagentBridge {
       }
     }
 
+    const rawModel = opts.model ??
+      (typeof item.model === 'string' && item.model.trim() !== '' ? item.model.trim() : undefined) ??
+      (typeof item.Model === 'string' && item.Model.trim() !== '' && item.Model.trim() !== 'inherit' ? item.Model.trim() : undefined) ??
+      (typeof rawArgs.model === 'string' && rawArgs.model.trim() !== '' ? rawArgs.model.trim() : undefined) ??
+      (typeof rawArgs.Model === 'string' && rawArgs.Model.trim() !== '' && rawArgs.Model.trim() !== 'inherit' ? rawArgs.Model.trim() : undefined)
+    const subagentModel = rawModel || 'gemini-2.5-flash'
+
     const runId = 'subagent-run-' + randomUUID()
-    const subagentId = 'subagent-session-' + randomUUID()
+    let conversationId = effectiveConvId
+    let logAbsoluteUri = opts.logAbsoluteUri
+    const subagentId = conversationId
+      ? (conversationId.startsWith('agy-') ? conversationId : `agy-${conversationId}`)
+      : `subagent-session-${randomUUID()}`
     const startedAt = Date.now()
 
     // 1. Lineage resolution
@@ -268,14 +343,14 @@ export class SubagentBridge {
       }
     }
 
-    // Strict absolute cwd resolution (Defect 1)
+    // Strict absolute cwd resolution
     const parentCwd = parentSession?.header?.cwd ?? (parentSession?.meta?.cwd as string | undefined)
     const rawCwd = (opts.cwd && opts.cwd.trim() !== '')
       ? opts.cwd.trim()
       : (parentCwd && parentCwd.trim() !== '')
       ? parentCwd.trim()
       : process.cwd()
-    const safeCwd = isAbsolute(rawCwd) ? rawCwd : resolve(rawCwd)
+    const safeCwd = resolve(rawCwd) // 必须为规范化绝对路径
 
     // 2. Create authoritative DSH sub-session
     let childSession: DshSession | undefined
@@ -294,7 +369,7 @@ export class SubagentBridge {
       }
     }
 
-    // 3. Write authoritative subagent descriptor
+    // 3. Write authoritative subagent descriptor and user prompt (DSH Subagent Seam)
     if (childSession?.append) {
       try {
         childSession.append('turn/start', { turn: 1 })
@@ -303,6 +378,12 @@ export class SubagentBridge {
           mode: 'one-shot',
           provider: 'antigravity',
           label: label || description || task,
+        })
+        childSession.append('user/message', {
+          id: `msg-user-${randomUUID()}`,
+          role: 'user',
+          source: { kind: 'user' },
+          content: [{ type: 'text', text: promptText || task || description || 'Subagent execution' }],
         })
       } catch (err) {
         this.log?.(`Failed to append subagent descriptor to child session: ${String(err)}`)
@@ -325,42 +406,69 @@ export class SubagentBridge {
     this.log?.(`Subagent started: [${subagentType}] ${description} (runId=${runId}, subagentId=${subagentId})`)
     this.emitter?.emit('subagent/start', startPayload)
 
-    // 5. Poll / tail transcript.jsonl from agy's brain directory
-    const brainDir = defaultBrainDir(opts.accountHome)
-    let transcriptFile: string | null = null
+    // 5. Targeted Transcript Tailer
+    let transcriptFile: string | null = logAbsoluteUri ? uriToPath(logAbsoluteUri) : null
+    if (transcriptFile) {
+      this.claimedTranscriptPaths.add(transcriptFile)
+    }
+
     let fileOffset = 0
+    let carryover = ''
     let stopped = false
     let pollTimer: NodeJS.Timeout | null = null
     let stepCounter = 1
+    const decoder = new StringDecoder('utf8')
+
+    // Tool call / result FIFO pairing queue
+    const pendingToolCallIds: string[] = []
+    let hasStreamedAssistantChunk = false
 
     const findTranscript = (): string | null => {
+      const brainDir = defaultBrainDir(opts.accountHome)
       if (!existsSync(brainDir)) return null
-      try {
-        const dirs = readdirSync(brainDir, { withFileTypes: true })
-          .filter((d) => d.isDirectory())
-          .map((d) => {
-            const p = join(brainDir, d.name)
-            try {
-              const st = statSync(p)
-              return { path: p, mtime: st.mtimeMs }
-            } catch {
-              return { path: p, mtime: 0 }
-            }
-          })
-          .sort((a, b) => b.mtime - a.mtime)
 
-        for (const candidate of dirs) {
-          if (candidate.mtime < startedAt - 1000) {
-            // Historic run directory before this subagent started — skip
-            continue
-          }
-          const tFile = join(candidate.path, '.system_generated', 'logs', 'transcript.jsonl')
-          if (existsSync(tFile)) {
-            return tFile
-          }
+      // 1. Direct path probing when conversationId is known
+      if (conversationId) {
+        const directFile = join(brainDir, conversationId, '.system_generated', 'logs', 'transcript.jsonl')
+        if (existsSync(directFile)) {
+          this.claimedTranscriptPaths.add(directFile)
+          return directFile
         }
-      } catch {
-        // ignore
+      }
+
+      // 2. Fallback to mtime directory detection only when conversationId is unknown
+      if (!conversationId) {
+        try {
+          const dirs = readdirSync(brainDir, { withFileTypes: true })
+            .filter((d) => d.isDirectory())
+            .map((d) => {
+              const p = join(brainDir, d.name)
+              try {
+                const st = statSync(p)
+                return { path: p, mtime: st.mtimeMs }
+              } catch {
+                return { path: p, mtime: 0 }
+              }
+            })
+            .sort((a, b) => b.mtime - a.mtime)
+
+          for (const candidate of dirs) {
+            if (candidate.mtime < startedAt - 1000) {
+              // Historic run directory before this subagent started — skip
+              continue
+            }
+            const tFile = join(candidate.path, '.system_generated', 'logs', 'transcript.jsonl')
+            if (this.claimedTranscriptPaths.has(tFile)) {
+              continue
+            }
+            if (existsSync(tFile)) {
+              this.claimedTranscriptPaths.add(tFile)
+              return tFile
+            }
+          }
+        } catch {
+          // ignore
+        }
       }
       return null
     }
@@ -368,15 +476,88 @@ export class SubagentBridge {
     const appendStepToChildSession = (stepObj: Record<string, unknown>) => {
       if (!childSession?.append) return
       try {
-        if (stepObj.tool || stepObj.type === 'tool' || stepObj.tool_name) {
+        // Thinking / reasoning
+        if (typeof stepObj.thinking === 'string' && stepObj.thinking.length > 0) {
+          childSession.append('assistant/chunk', {
+            turn: 1,
+            step: stepCounter++,
+            chunk: {
+              type: 'reasoning-delta',
+              index: 0,
+              text: stepObj.thinking,
+            },
+          })
+        }
+
+        // Tool calls
+        if (Array.isArray(stepObj.tool_calls) && stepObj.tool_calls.length > 0) {
+          for (const tc of stepObj.tool_calls) {
+            if (tc && typeof tc === 'object') {
+              const tcObj = tc as Record<string, unknown>
+              const callName = String(tcObj.name ?? 'tool')
+              const callArgs = typeof tcObj.args === 'string' ? tcObj.args : JSON.stringify(tcObj.args ?? {})
+              const callId = String(tcObj.id ?? tcObj.call_id ?? `agytc-sub-${stepCounter}`)
+              pendingToolCallIds.push(callId)
+              childSession.append('tool/call', {
+                turn: 1,
+                step: stepCounter++,
+                callId,
+                name: callName,
+                arguments: callArgs,
+              })
+            }
+          }
+        } else if (stepObj.tool || stepObj.type === 'tool' || stepObj.tool_name) {
+          const callId = String(stepObj.call_id ?? stepObj.callId ?? `agytc-sub-${stepCounter}`)
+          pendingToolCallIds.push(callId)
           childSession.append('tool/call', {
             turn: 1,
             step: stepCounter++,
-            callId: String(stepObj.call_id ?? stepObj.callId ?? `agytc-sub-${stepCounter}`),
+            callId,
             name: String(stepObj.tool ?? stepObj.tool_name ?? 'tool'),
             arguments: typeof stepObj.args === 'string' ? stepObj.args : JSON.stringify(stepObj.args ?? {}),
           })
-        } else {
+        }
+
+        // Tool results (GENERIC or tool_result)
+        if (stepObj.type === 'GENERIC' || stepObj.type === 'tool_result' || stepObj.event === 'tool_result') {
+          const resText = typeof stepObj.content === 'string'
+            ? stepObj.content
+            : typeof stepObj.output === 'string'
+            ? stepObj.output
+            : JSON.stringify(stepObj)
+          
+          const rawCallId = stepObj.call_id ?? stepObj.callId ?? stepObj.tool_call_id
+          let matchedCallId: string
+          if (rawCallId !== undefined && rawCallId !== null && String(rawCallId).trim() !== '') {
+            matchedCallId = String(rawCallId)
+            const idx = pendingToolCallIds.indexOf(matchedCallId)
+            if (idx >= 0) {
+              pendingToolCallIds.splice(idx, 1)
+            }
+          } else if (pendingToolCallIds.length > 0) {
+            matchedCallId = pendingToolCallIds.shift()!
+          } else {
+            matchedCallId = `agytc-sub-${stepCounter}`
+          }
+
+          childSession.append('tool/result', {
+            turn: 1,
+            step: stepCounter++,
+            callId: matchedCallId,
+            output: resText,
+            isError: stepObj.status === 'ERROR',
+          })
+        }
+
+        // Assistant response text (if not USER_INPUT and not GENERIC tool result)
+        if (
+          stepObj.type !== 'USER_INPUT' &&
+          stepObj.source !== 'USER_EXPLICIT' &&
+          stepObj.type !== 'GENERIC' &&
+          stepObj.type !== 'tool_result' &&
+          stepObj.event !== 'tool_result'
+        ) {
           const text = typeof stepObj.text === 'string'
             ? stepObj.text
             : typeof stepObj.content === 'string'
@@ -385,72 +566,101 @@ export class SubagentBridge {
             ? stepObj.step
             : typeof stepObj.message === 'string'
             ? stepObj.message
-            : JSON.stringify(stepObj)
-          childSession.append('assistant/chunk', {
-            turn: 1,
-            step: stepCounter++,
-            chunk: {
-              type: 'text-delta',
-              index: 0,
-              text: text.endsWith('\n') ? text : text + '\n',
-            },
-          })
+            : undefined
+
+          if (text !== undefined && text.length > 0) {
+            hasStreamedAssistantChunk = true
+            childSession.append('assistant/chunk', {
+              turn: 1,
+              step: stepCounter++,
+              chunk: {
+                type: 'text-delta',
+                index: 0,
+                text: text.endsWith('\n') ? text : text + '\n',
+              },
+            })
+          }
         }
       } catch (err) {
         this.log?.(`Failed to append step to child session: ${String(err)}`)
       }
     }
 
+    const isTerminalStep = (parsed: Record<string, unknown>): boolean => {
+      if (parsed.status === 'ERROR') return true
+      if (parsed.event === 'result' || parsed.type === 'result' || parsed.type === 'final') return true
+      if (
+        (parsed.status === 'DONE' || parsed.status === 'COMPLETED') &&
+        (parsed.type === 'PLANNER_RESPONSE' || parsed.type === 'agent_response') &&
+        (!parsed.tool_calls || (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length === 0))
+      ) {
+        return true
+      }
+      return false
+    }
+
+    const CHUNK_SIZE = 64 * 1024
+
     const poll = () => {
       if (stopped) return
+      let hasMoreToRead = false
       try {
         if (!transcriptFile) {
           transcriptFile = findTranscript()
         }
         if (transcriptFile && existsSync(transcriptFile)) {
-          const content = readFileSync(transcriptFile, 'utf8')
-          const lastNl = content.lastIndexOf('\n')
-          if (lastNl >= fileOffset) {
-            const newChunk = content.slice(fileOffset, lastNl)
-            fileOffset = lastNl + 1
-            const lines = newChunk.split('\n').map((l) => l.trim()).filter(Boolean)
-            for (const line of lines) {
-              try {
-                const parsed = JSON.parse(line) as Record<string, unknown>
-                opts.onStep?.(parsed)
-                this.emitter?.emit('subagent/step', {
-                  runId,
-                  id: subagentId,
-                  step: parsed,
-                })
-                appendStepToChildSession(parsed)
+          const st = statSync(transcriptFile)
+          if (st.size < fileOffset) {
+            fileOffset = 0
+            carryover = ''
+          }
+          if (st.size > fileOffset) {
+            const fd = openSync(transcriptFile, 'r')
+            try {
+              const bytesToRead = Math.min(st.size - fileOffset, CHUNK_SIZE)
+              const buf = Buffer.alloc(bytesToRead)
+              const bytesRead = readSync(fd, buf, 0, bytesToRead, fileOffset)
+              fileOffset += bytesRead
+              hasMoreToRead = st.size > fileOffset
+              const chunkStr = carryover + decoder.write(buf.subarray(0, bytesRead))
+              const lastNl = chunkStr.lastIndexOf('\n')
+              if (lastNl >= 0) {
+                const completeLines = chunkStr.slice(0, lastNl).split('\n')
+                carryover = chunkStr.slice(lastNl + 1)
+                for (const line of completeLines) {
+                  const trimmed = line.trim()
+                  if (!trimmed) continue
+                  try {
+                    const parsed = JSON.parse(trimmed) as Record<string, unknown>
+                    opts.onStep?.(parsed)
+                    this.emitter?.emit('subagent/step', {
+                      runId,
+                      id: subagentId,
+                      step: parsed,
+                    })
+                    appendStepToChildSession(parsed)
 
-                // Detect terminal condition from transcript (Defect 4)
-                const isTerminal =
-                  (
-                    (parsed.status === 'DONE' || parsed.status === 'COMPLETED') &&
-                    (parsed.type === 'PLANNER_RESPONSE' || parsed.type === 'agent_response' || parsed.type === 'result' || parsed.type === 'final') &&
-                    (!parsed.tool_calls || (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length === 0))
-                  ) ||
-                  parsed.event === 'result' ||
-                  parsed.type === 'result' ||
-                  parsed.status === 'ERROR'
-
-                if (isTerminal && !stopped) {
-                  const errText = parsed.status === 'ERROR'
-                    ? String(parsed.error ?? parsed.message ?? 'subagent error')
-                    : undefined
-                  const resText = typeof parsed.content === 'string'
-                    ? parsed.content
-                    : typeof parsed.response === 'string'
-                    ? parsed.response
-                    : undefined
-                  session.stop(errText, resText)
-                  return
+                    if (isTerminalStep(parsed) && !stopped) {
+                      const errText = parsed.status === 'ERROR'
+                        ? String(parsed.error ?? parsed.message ?? 'subagent error')
+                        : undefined
+                      const resText = typeof parsed.content === 'string'
+                        ? parsed.content
+                        : typeof parsed.response === 'string'
+                        ? parsed.response
+                        : undefined
+                      session.stop(errText, resText)
+                      return
+                    }
+                  } catch {
+                    // skip malformed line
+                  }
                 }
-              } catch {
-                // skip malformed line
+              } else {
+                carryover = chunkStr
               }
+            } finally {
+              closeSync(fd)
             }
           }
         }
@@ -458,55 +668,121 @@ export class SubagentBridge {
         // best effort polling
       }
       if (!stopped) {
-        pollTimer = setTimeout(poll, 150)
+        pollTimer = setTimeout(poll, hasMoreToRead ? 5 : 150)
         pollTimer.unref?.()
       }
     }
 
-    // Start polling for transcript lines
+    // Start polling
     pollTimer = setTimeout(poll, 50)
     pollTimer.unref?.()
 
     const session: SubagentSession = {
       runId,
       subagentId,
+      get conversationId() { return conversationId },
+      get logAbsoluteUri() { return logAbsoluteUri },
       childSession,
       task,
       description,
       subagentType,
       startedAt,
+      get isStopped() { return stopped },
+      bindLogUri: (uri: string, convId?: string) => {
+        if (convId && !conversationId) {
+          conversationId = convId
+          this.sessionsByConversationId.set(convId, session)
+        }
+        logAbsoluteUri = uri
+        const resolved = uriToPath(uri)
+        if (transcriptFile !== resolved) {
+          if (transcriptFile) {
+            this.claimedTranscriptPaths.delete(transcriptFile)
+          }
+          transcriptFile = resolved
+          this.claimedTranscriptPaths.add(resolved)
+          fileOffset = 0
+          carryover = ''
+          if (pollTimer) clearTimeout(pollTimer)
+          pollTimer = setTimeout(poll, 10)
+          pollTimer.unref?.()
+        }
+      },
       stop: (error?: string, resultText?: string) => {
         if (stopped) return
         stopped = true
-        if (pollTimer) clearTimeout(pollTimer)
+        if (pollTimer) {
+          clearTimeout(pollTimer)
+          pollTimer = null
+        }
+        if (transcriptFile) {
+          this.claimedTranscriptPaths.delete(transcriptFile)
+        }
 
-        // Read remaining lines one last time
+        // Read remaining lines in bounded chunks
         try {
           if (transcriptFile && existsSync(transcriptFile)) {
-            const content = readFileSync(transcriptFile, 'utf8')
-            if (content.length > fileOffset) {
-              const newChunk = content.slice(fileOffset)
-              const lines = newChunk.split('\n').map((l) => l.trim()).filter(Boolean)
-              for (const line of lines) {
-                try {
-                  const parsed = JSON.parse(line) as Record<string, unknown>
-                  opts.onStep?.(parsed)
-                  this.emitter?.emit('subagent/step', {
-                    runId,
-                    id: subagentId,
-                    step: parsed,
-                  })
-                  appendStepToChildSession(parsed)
-                } catch {}
+            const st = statSync(transcriptFile)
+            if (st.size > fileOffset) {
+              const fd = openSync(transcriptFile, 'r')
+              try {
+                while (st.size > fileOffset) {
+                  const bytesToRead = Math.min(st.size - fileOffset, CHUNK_SIZE)
+                  const buf = Buffer.alloc(bytesToRead)
+                  const bytesRead = readSync(fd, buf, 0, bytesToRead, fileOffset)
+                  fileOffset += bytesRead
+                  const chunkStr = carryover + decoder.write(buf.subarray(0, bytesRead))
+                  const lastNl = chunkStr.lastIndexOf('\n')
+                  if (lastNl >= 0) {
+                    const completeLines = chunkStr.slice(0, lastNl).split('\n')
+                    carryover = chunkStr.slice(lastNl + 1)
+                    for (const line of completeLines) {
+                      const trimmed = line.trim()
+                      if (!trimmed) continue
+                      try {
+                        const parsed = JSON.parse(trimmed) as Record<string, unknown>
+                        opts.onStep?.(parsed)
+                        this.emitter?.emit('subagent/step', {
+                          runId,
+                          id: subagentId,
+                          step: parsed,
+                        })
+                        appendStepToChildSession(parsed)
+                      } catch {}
+                    }
+                  } else {
+                    carryover = chunkStr
+                  }
+                }
+              } finally {
+                closeSync(fd)
               }
             }
           }
         } catch {}
 
+        if (carryover.trim()) {
+          const remaining = carryover + decoder.end()
+          carryover = ''
+          const lines = remaining.split('\n').map((l) => l.trim()).filter(Boolean)
+          for (const line of lines) {
+            try {
+              const parsed = JSON.parse(line) as Record<string, unknown>
+              opts.onStep?.(parsed)
+              this.emitter?.emit('subagent/step', {
+                runId,
+                id: subagentId,
+                step: parsed,
+              })
+              appendStepToChildSession(parsed)
+            } catch {}
+          }
+        }
+
         // Append final result and turn/end to DSH child session
         if (childSession?.append) {
           try {
-            if (resultText) {
+            if (resultText && !hasStreamedAssistantChunk) {
               childSession.append('assistant/message', {
                 turn: 1,
                 step: stepCounter++,
@@ -517,48 +793,126 @@ export class SubagentBridge {
                   source: {
                     kind: 'model',
                     provider: 'antigravity',
-                    model: 'gemini-3.8-flash',
+                    model: subagentModel,
                   },
                   content: [{ type: 'text', text: resultText }],
                 },
               })
             }
+            const isAborted = error === 'aborted'
             childSession.append('turn/end', {
               turn: 1,
-              reason: { kind: error ? 'error' : 'completed' },
+              reason: { kind: isAborted ? 'aborted' : (error ? 'error' : 'completed') },
             })
           } catch (err) {
             this.log?.(`Failed to append terminal state to child session: ${String(err)}`)
           }
         }
 
+        const isAborted = error === 'aborted'
         const endPayload: SubagentEndInfo = {
           runId,
           provider: 'antigravity',
           id: subagentId,
           local: true,
-          stopReason: error ? 'error' : 'endTurn',
+          stopReason: isAborted ? 'aborted' : (error ? 'error' : 'endTurn'),
           lastAssistantMessage: resultText ? [{ type: 'text', text: resultText }] : undefined,
         }
 
         this.log?.(`Subagent completed: ${runId} (stopReason=${endPayload.stopReason})`)
         this.emitter?.emit('subagent/end', endPayload)
         this.activeSubagents.delete(runId)
+        opts.onStop?.(session, error, resultText)
       },
     }
 
     this.activeSubagents.set(runId, session)
+    if (conversationId) {
+      this.sessionsByConversationId.set(conversationId, session)
+    }
+    if (opts.stepKey) {
+      this.sessionsByStepKey.set(opts.stepKey, session)
+    }
+
     return session
   }
 
+  /**
+   * Start a subagent session when agy calls invoke_subagent.
+   * Backwards compatible delegate to getOrStartSubagent.
+   */
+  startSubagent(opts: StartSubagentOptions & { stepKey?: string }): SubagentSession {
+    return this.getOrStartSubagent(opts)
+  }
+
   getActive(runId: string): SubagentSession | undefined {
-    return this.activeSubagents.get(runId)
+    const s = this.activeSubagents.get(runId)
+    return s && !s.isStopped ? s : undefined
+  }
+
+  getActiveSubagents(): readonly SubagentSession[] {
+    return Array.from(this.activeSubagents.values()).filter((s) => !s.isStopped)
+  }
+
+  hasActiveSubagents(): boolean {
+    return this.getActiveSubagents().length > 0
+  }
+
+  getActiveByConversationId(conversationId: string): SubagentSession | undefined {
+    const s = this.sessionsByConversationId.get(conversationId)
+    if (s && !s.isStopped) return s
+    for (const sub of this.activeSubagents.values()) {
+      if (sub.conversationId === conversationId && !sub.isStopped) return sub
+    }
+    return undefined
+  }
+
+  getActiveByStepKey(stepKey: string): SubagentSession | undefined {
+    const s = this.sessionsByStepKey.get(stepKey)
+    if (s && !s.isStopped) return s
+    return undefined
+  }
+
+  stopSubagentByConversationId(conversationId: string, error?: string, resultText?: string): boolean {
+    const s = this.getActiveByConversationId(conversationId)
+    if (s) {
+      s.stop(error, resultText)
+      return true
+    }
+    return false
+  }
+
+  stopAllSubagents(error?: string, resultText?: string, parentSessionId?: string): void {
+    for (const s of Array.from(this.activeSubagents.values())) {
+      if (!s.isStopped) {
+        if (parentSessionId && s.childSession?.meta?.parentSession && s.childSession.meta.parentSession !== parentSessionId) {
+          continue
+        }
+        s.stop(error, resultText)
+      }
+    }
+  }
+
+  bindSubagentLogUri(keyOrConversationId: string, uri: string, conversationId?: string): boolean {
+    const s = this.getActiveByConversationId(keyOrConversationId) ??
+      this.getActiveByStepKey(keyOrConversationId) ??
+      this.getActive(keyOrConversationId)
+    if (s) {
+      s.bindLogUri(uri, conversationId)
+      return true
+    }
+    return false
   }
 
   dispose(): void {
-    for (const sub of this.activeSubagents.values()) {
-      sub.stop('aborted', 'Host unloaded')
+    for (const sub of Array.from(this.activeSubagents.values())) {
+      if (!sub.isStopped) {
+        sub.stop('aborted', 'Host unloaded')
+      }
     }
     this.activeSubagents.clear()
+    this.sessionsByStepKey.clear()
+    this.sessionsByConversationId.clear()
+    this.claimedTranscriptPaths.clear()
   }
 }

@@ -74,6 +74,119 @@ export interface EventMapperOptions {
   parentSessionId?: string
   accountHome?: string
   cwd?: string
+  model?: string
+}
+
+export interface ExtractedSubagentPayload {
+  conversationId?: string
+  logAbsoluteUri?: string
+  workspaceUris?: string[]
+}
+
+/**
+ * Extracts balanced JSON objects from text.
+ * Correctly handles nested braces, string escaping, and ignores braces inside string literals.
+ */
+export function extractBalancedJsonObjects(text: string): unknown[] {
+  const results: unknown[] = []
+  let depth = 0
+  let startIdx = -1
+  let inString = false
+  let escape = false
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!
+    if (inString) {
+      if (escape) {
+        escape = false
+      } else if (ch === '\\') {
+        escape = true
+      } else if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+
+    if (ch === '{') {
+      if (depth === 0) {
+        startIdx = i
+      }
+      depth++
+    } else if (ch === '}') {
+      if (depth > 0) {
+        depth--
+        if (depth === 0 && startIdx >= 0) {
+          const candidate = text.substring(startIdx, i + 1)
+          try {
+            const parsed = JSON.parse(candidate)
+            if (parsed && typeof parsed === 'object') {
+              results.push(parsed)
+            }
+          } catch {
+            // ignore invalid JSON slice
+          }
+          startIdx = -1
+        }
+      }
+    }
+  }
+
+  return results
+}
+
+/**
+ * Extracts conversationId and logAbsoluteUri from agy's invoke_subagent output.
+ * Handles parsed objects, plain JSON strings, and text containing embedded JSON blocks.
+ */
+export function parseSubagentOutput(output: unknown): ExtractedSubagentPayload {
+  if (!output) return {}
+  if (typeof output === 'object' && output !== null && !Array.isArray(output)) {
+    const o = output as Record<string, unknown>
+    const cid = o.conversationId ?? o.conversation_id
+    const uri = o.logAbsoluteUri ?? o.log_absolute_uri
+    const w = o.workspaceUris ?? o.workspace_uris
+    return {
+      conversationId: typeof cid === 'string' && cid.trim() !== '' ? cid.trim() : undefined,
+      logAbsoluteUri: typeof uri === 'string' && uri.trim() !== '' ? uri.trim() : undefined,
+      workspaceUris: Array.isArray(w) ? (w as string[]) : undefined,
+    }
+  }
+  if (typeof output === 'string') {
+    const s = output.trim()
+    if (!s) return {}
+
+    // 1. Direct JSON parse
+    try {
+      const parsed = JSON.parse(s)
+      if (parsed && typeof parsed === 'object') {
+        const res = parseSubagentOutput(parsed)
+        if (res.conversationId || res.logAbsoluteUri) return res
+      }
+    } catch {}
+
+    // 2. Embedded balanced JSON object(s) with brace balancing
+    const objects = extractBalancedJsonObjects(s)
+    for (const obj of objects) {
+      const res = parseSubagentOutput(obj)
+      if (res.conversationId || res.logAbsoluteUri) return res
+    }
+
+    // 3. Regex match for conversationId and logAbsoluteUri fallback
+    const cidMatch = s.match(/"(?:conversationId|conversation_id)"\s*:\s*"([^"]+)"/i)
+    const uriMatch = s.match(/"(?:logAbsoluteUri|log_absolute_uri)"\s*:\s*"([^"]+)"/i)
+    if (cidMatch || uriMatch) {
+      return {
+        conversationId: cidMatch?.[1]?.trim(),
+        logAbsoluteUri: uriMatch?.[1]?.trim(),
+      }
+    }
+  }
+  return {}
 }
 
 export class EventMapper {
@@ -84,7 +197,6 @@ export class EventMapper {
   private readonly announcedTools = new Set<string>()
   private readonly thinkingAnnounced = new Set<string>()
   private readonly subagentAnnounced = new Set<string>()
-  private activeSubagentSession?: SubagentSession
   private sawTextStep: boolean
   private finished = false
 
@@ -95,6 +207,37 @@ export class EventMapper {
   /** Whether a terminal finish chunk has been emitted. */
   get isFinished(): boolean {
     return this.finished
+  }
+
+  getActiveSubagents(): readonly SubagentSession[] {
+    return this.opts.subagentBridge?.getActiveSubagents() ?? []
+  }
+
+  private handleSubagentInvocation(
+    stepKey: string,
+    toolName: string,
+    toolArgs: unknown,
+    output?: unknown
+  ): void {
+    const payload = parseSubagentOutput(output)
+    const bridge = this.opts.subagentBridge
+    if (!bridge) return
+    const startOpts = {
+      stepKey,
+      toolName,
+      toolArgs,
+      conversationId: payload.conversationId,
+      logAbsoluteUri: payload.logAbsoluteUri,
+      parentSessionId: this.opts.parentSessionId,
+      accountHome: this.opts.accountHome,
+      cwd: this.opts.cwd,
+      model: this.opts.model,
+    }
+    if (typeof (bridge as { getOrStartSubagent?: unknown }).getOrStartSubagent === 'function') {
+      bridge.getOrStartSubagent(startOpts)
+    } else if (typeof bridge.startSubagent === 'function') {
+      bridge.startSubagent(startOpts)
+    }
   }
 
   private *ensureBlock(type: 'text' | 'reasoning'): Generator<StreamChunk> {
@@ -155,6 +298,19 @@ export class EventMapper {
     if (ev.kind === 'init') return
     if (ev.kind === 'garbage') return
     if (ev.kind === 'step') {
+      // Detect SYSTEM_MESSAGE notifying subagent completion: sender=<conversationId>
+      if (ev.text && (ev.text.includes('<SYSTEM_MESSAGE>') || ev.text.includes('[Message]'))) {
+        const senderMatch = ev.text.match(/sender=([a-f0-9\-]+|[^\s]+)/i)
+        if (senderMatch && senderMatch[1]) {
+          const senderId = senderMatch[1]
+          const contentMatch = ev.text.match(/content=(.*?)(?:\n|<\/SYSTEM_MESSAGE>|$)/i)
+          const resText = (contentMatch && contentMatch[1]) ? contentMatch[1].trim() : undefined
+          if (typeof this.opts.subagentBridge?.stopSubagentByConversationId === 'function') {
+            this.opts.subagentBridge.stopSubagentByConversationId(senderId, undefined, resText)
+          }
+        }
+      }
+
       if (ev.usage) this.opts.usage?.noteStepUsage(ev.usage)
       if (ev.stepKind === 'text') {
         // agy ≥1.1.15 thinking turns: agent_response steps with usage but no
@@ -226,24 +382,10 @@ export class EventMapper {
             if (toolCandidate.name === 'define_subagent' || toolCandidate.name === 'defineSubagent') {
               this.opts.subagentBridge?.defineRole(toolCandidate.args)
             } else if (toolCandidate.name === 'invoke_subagent' || toolCandidate.name === 'run_subagent') {
-              if (!this.activeSubagentSession) {
-                this.activeSubagentSession = this.opts.subagentBridge?.startSubagent({
-                  toolName: toolCandidate.name,
-                  toolArgs: toolCandidate.args,
-                  parentSessionId: this.opts.parentSessionId,
-                  accountHome: this.opts.accountHome,
-                  cwd: this.opts.cwd,
-                })
-              }
+              this.handleSubagentInvocation(ev.stepKey, toolCandidate.name, toolCandidate.args, toolCandidate.output ?? stepPayload.output)
             }
-          } else if (!this.activeSubagentSession && (stepPayload.Subagents || stepPayload.subagents || stepPayload.subagent_type || stepPayload.agent_type)) {
-            this.activeSubagentSession = this.opts.subagentBridge?.startSubagent({
-              toolName: 'invoke_subagent',
-              toolArgs: stepPayload,
-              parentSessionId: this.opts.parentSessionId,
-              accountHome: this.opts.accountHome,
-              cwd: this.opts.cwd,
-            })
+          } else if (stepPayload.Subagents || stepPayload.subagents || stepPayload.subagent_type || stepPayload.agent_type) {
+            this.handleSubagentInvocation(ev.stepKey, 'invoke_subagent', stepPayload, stepPayload.output)
           }
         }
 
@@ -284,15 +426,7 @@ export class EventMapper {
           this.opts.subagentBridge?.defineRole(ev.tool.args)
         }
         if (ev.tool.name === 'invoke_subagent' || ev.tool.name === 'run_subagent') {
-          if (!this.activeSubagentSession) {
-            this.activeSubagentSession = this.opts.subagentBridge?.startSubagent({
-              toolName: ev.tool.name,
-              toolArgs: ev.tool.args,
-              parentSessionId: this.opts.parentSessionId,
-              accountHome: this.opts.accountHome,
-              cwd: this.opts.cwd,
-            })
-          }
+          this.handleSubagentInvocation(ev.stepKey, ev.tool.name, ev.tool.args, ev.tool.output)
         }
         // Only a COMPLETED step (output or error recorded) becomes a card.
         // ACTIVE envelopes arrive first with name/args only; the span waits
@@ -341,9 +475,8 @@ export class EventMapper {
       return;
     }
     // result
-    if (this.activeSubagentSession) {
-      this.activeSubagentSession.stop(ev.error, ev.response)
-      this.activeSubagentSession = undefined
+    if (typeof this.opts.subagentBridge?.stopAllSubagents === 'function') {
+      this.opts.subagentBridge.stopAllSubagents(ev.error, ev.response, this.opts.parentSessionId)
     }
     if (!ev.ok) {
       // agy reports status=ERROR even when a usable response exists (e.g. a
@@ -393,9 +526,8 @@ export class EventMapper {
   /** Terminal error/abort: close what is open, zero usage, failure finish. */
   *emitFailure(kind: 'error' | 'aborted', code: string, message: string): Generator<StreamChunk> {
     if (this.finished) return
-    if (this.activeSubagentSession) {
-      this.activeSubagentSession.stop(message)
-      this.activeSubagentSession = undefined
+    if (typeof this.opts.subagentBridge?.stopAllSubagents === 'function') {
+      this.opts.subagentBridge.stopAllSubagents(kind === 'aborted' ? 'aborted' : message, undefined, this.opts.parentSessionId)
     }
     const close = this.closeOpen()
     if (close) yield close
