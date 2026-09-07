@@ -19,6 +19,13 @@ import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
 import { isolatedHomeEnv, startAgyProcess, type AgyProcessSupervisor, type RunOutcome } from './runner.ts'
 import { sanitizePromptForAgy } from './skills-bridge.ts'
 import type { SubagentBridge } from './subagent-bridge.ts'
+
+export const SYSTEM_BACKGROUND_SERVICE_DIRECTIVE = `<SYSTEM_BACKGROUND_SERVICE_DIRECTIVE>
+CRITICAL OPERATIONAL DIRECTIVE:
+You have access to the "background_service" tool (also exposed as "mcp_dsh_managed__dsh_tools_background_service" depending on the client tool naming convention) to manage long-running background processes (such as dev servers, mock APIs, emulators, daemons, and file watchers).
+NEVER launch long-running or blocking background processes directly using "run_command" or terminal commands (e.g. npm start, vite, node server.js, python -m http.server, etc. without background management). Doing so hangs the execution pipeline.
+Always use "background_service" (or "mcp_dsh_managed__dsh_tools_background_service") with action="start" to launch long-running tasks, and use action="status", "logs", and "stop" to manage them.
+</SYSTEM_BACKGROUND_SERVICE_DIRECTIVE>`
 import { Heartbeat } from './heartbeat.ts'
 import { stateDir } from '../common/config.ts'
 import type { SessionStore } from './sessions.ts'
@@ -597,9 +604,6 @@ export class AgyAdapter extends LlmAdapter {
         }
       }
     }
-    if (cfg.forwardSystemPrompt && options.system) {
-      prompt = 'System instructions:\n' + sanitizePromptForAgy(options.system) + '\n\n' + prompt;
-    }
 
     // ---- multimodal staging (v0.2): images ride as staged files ----
     let stagedDirs: string[] = []
@@ -643,6 +647,17 @@ export class AgyAdapter extends LlmAdapter {
       }
     } else if (prompt.trim() === '') {
       throw new LlmError('request carries no user text to forward to agy', Err.AGY_ERROR)
+    }
+
+    const hasForwardedSystem = Boolean(cfg.forwardSystemPrompt && options.system)
+    const hasServiceDirective = Boolean(cfg.mcpBridge && !isAux)
+
+    if (hasForwardedSystem && hasServiceDirective) {
+      prompt = 'System instructions:\n' + sanitizePromptForAgy(options.system!) + '\n\n' + SYSTEM_BACKGROUND_SERVICE_DIRECTIVE + '\n\n' + prompt
+    } else if (hasForwardedSystem) {
+      prompt = 'System instructions:\n' + sanitizePromptForAgy(options.system!) + '\n\n' + prompt
+    } else if (hasServiceDirective) {
+      prompt = 'System instructions:\n' + SYSTEM_BACKGROUND_SERVICE_DIRECTIVE + '\n\n' + prompt
     }
 
     // In-flight duplicate submission debounce (prevents double-clicks / network repeat loops)

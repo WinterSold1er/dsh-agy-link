@@ -57,6 +57,14 @@ export interface McpServerConfig {
   type?: string
 }
 
+/** Interface contract for synthetic internal tools served via MCP bridge. */
+export interface InternalTool {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+  execute(args: Record<string, unknown>): Promise<unknown>
+}
+
 /** Minimal structural view of the DSH tool registry we need. */
 export interface ToolsServiceLike {
   schemas(): Array<{ name: string; description: string; parameters: Record<string, unknown> }>
@@ -128,16 +136,19 @@ function resultText(result: unknown): string {
   }
 }
 
+export interface BridgeOptions {
+  bridgeScript: string
+  tools: () => ToolsServiceLike | undefined
+  internalTools?: () => InternalTool[]
+  allowlist: () => string
+  log?: (msg: string) => void
+}
+
 /**
  * Start the loopback endpoint. Resolves once listening. The tools service
  * may arrive later (optional service): pass a thunk.
  */
-export function startMcpBridge(opts: {
-  bridgeScript: string
-  tools: () => ToolsServiceLike | undefined
-  allowlist: () => string
-  log?: (msg: string) => void
-}): Promise<McpBridge> {
+export function startMcpBridge(opts: BridgeOptions): Promise<McpBridge> {
   const token = randomBytes(24).toString('hex')
   let callSeq = 0
   const server: Server = createServer((req, res) => {
@@ -150,53 +161,108 @@ export function startMcpBridge(opts: {
       }
       if ((req.method === 'GET' || req.method === 'POST') && (url === '/tools' || url === '/mcp/tools')) {
         const svc = opts.tools()
-        if (!svc) {
+        const internal = opts.internalTools ? opts.internalTools() : []
+        if (!svc && internal.length === 0) {
           sendJson(res, 503, { error: 'tools service unavailable' })
           return
         }
         const allow = opts.allowlist().split(',').map((s) => s.trim()).filter(Boolean)
         const allowSet = new Set(allow)
         const seen = new Set<string>()
-        const tools = svc.schemas()
-          .filter((t) => allow.length === 0 || allowSet.has(t.name))
-          .filter((t) => {
-            // internal transports and our own ask tool are not bridgeable
-            if (t.name === 'run_code' || t.name === 'agy_ask') return false
-            const mapped = toMcpName(t.name)
-            if (seen.has(mapped)) return false // collision after mapping
+        const tools: Array<{ name: string; dshName: string; description: string; inputSchema: Record<string, unknown> }> = []
+
+        // Internal synthetic tools first (always exposed to bridge, bypassed around DSH UI)
+        for (const it of internal) {
+          const mapped = toMcpName(it.name)
+          if (!seen.has(mapped)) {
             seen.add(mapped)
-            return true
-          })
-          .map((t) => ({
-            name: toMcpName(t.name),
-            dshName: t.name,
-            description: t.description,
-            inputSchema: { type: 'object', ...t.parameters },
-          }))
+            tools.push({
+              name: mapped,
+              dshName: it.name,
+              description: it.description,
+              inputSchema: { type: 'object', ...(it.parameters || {}) },
+            })
+          }
+        }
+
+        // DSH tools service schemas
+        if (svc) {
+          const dshTools = svc.schemas()
+            .filter((t) => allow.length === 0 || allowSet.has(t.name))
+            .filter((t) => {
+              // internal transports and our own ask tool are not bridgeable
+              if (t.name === 'run_code' || t.name === 'agy_ask') return false
+              const mapped = toMcpName(t.name)
+              if (seen.has(mapped)) return false // collision after mapping
+              seen.add(mapped)
+              return true
+            })
+            .map((t) => ({
+              name: toMcpName(t.name),
+              dshName: t.name,
+              description: t.description,
+              inputSchema: { type: 'object', ...t.parameters },
+            }))
+          tools.push(...dshTools)
+        }
+
         sendJson(res, 200, { tools })
         return;
       }
       if (req.method === 'POST' && (url === '/call' || url === '/mcp/call')) {
         const body = await readBody(req)
-        let parsed: { dshName?: unknown; arguments?: unknown } = {}
+        let parsed: { dshName?: unknown; name?: unknown; arguments?: unknown } = {}
         try {
           parsed = JSON.parse(body) as typeof parsed
         } catch {
           sendJson(res, 400, { error: 'invalid JSON' })
           return
         }
+
+        let targetName = typeof parsed.dshName === 'string' ? parsed.dshName : ''
+        const rawName = typeof (parsed as { name?: unknown }).name === 'string' ? (parsed as { name: string }).name : ''
+        if (targetName === '' && rawName !== '') {
+          targetName = rawName
+        }
+
+        // 1. Priority dispatch: internal synthetic tools execute locally and NEVER report to DSH ToolsService
+        const internalList = opts.internalTools ? opts.internalTools() : []
+        const matchedInternal = internalList.find(
+          (it) =>
+            it.name === targetName ||
+            toMcpName(it.name) === targetName ||
+            (rawName !== '' && (it.name === rawName || toMcpName(it.name) === rawName)),
+        )
+
+        if (matchedInternal) {
+          callSeq++
+          try {
+            const args = parsed.arguments && typeof parsed.arguments === 'object'
+              ? (parsed.arguments as Record<string, unknown>)
+              : {}
+            const result = await matchedInternal.execute(args)
+            sendJson(res, 200, { ok: true, text: resultText(result) })
+          } catch (e) {
+            sendJson(res, 200, { ok: false, error: String(e) })
+          }
+          return
+        }
+
+        // 2. Regular DSH ToolsService forwarding
         const svc = opts.tools()
         if (!svc) {
           sendJson(res, 503, { error: 'tools service unavailable' })
           return
         }
-        let dshName = typeof parsed.dshName === 'string' ? parsed.dshName : ''
+        let dshName = targetName
         if (dshName === '') {
-          const rawName = typeof (parsed as { name?: unknown }).name === 'string' ? (parsed as { name: string }).name : ''
           if (rawName !== '') {
             const hit = svc.schemas().find((t) => toMcpName(t.name) === rawName || t.name === rawName)
             if (hit) dshName = hit.name
           }
+        } else {
+          const hit = svc.schemas().find((t) => toMcpName(t.name) === dshName || t.name === dshName)
+          if (hit) dshName = hit.name
         }
         if (dshName === '' || dshName === 'run_code' || dshName === 'agy_ask') {
           sendJson(res, 400, { error: 'bad tool name' })

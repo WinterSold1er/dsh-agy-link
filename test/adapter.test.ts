@@ -496,7 +496,7 @@ test('returning session digests only foreign turns since the watermark', async (
   const argv2 = JSON.parse(readFileSync(argsFile2, 'utf8')) as string[]
   const prompt2 = argv2[argv2.indexOf('-p') + 1] ?? ''
   assert.ok(!prompt2.includes('[conversation so far]'), 'clean follow-up carries no digest')
-  assert.equal(prompt2, 'third')
+  assert.ok(prompt2.endsWith('third'))
 })
 
 test('unspawnable binary maps to PROCESS_EXIT without hanging', async () => {

@@ -28,6 +28,8 @@ import { defaultMediaDir, sweepDir, type ImageRefLike } from './host/media.ts'
 import { startMcpBridge, writeMcpConfig, shadowMergeGeminiMcpConfig, cleanOrphanMcpConfigs, type McpBridge, type ToolsServiceLike } from './host/mcp-bridge.ts'
 import { scanAndStageSkills } from './host/skills-bridge.ts'
 import { SubagentBridge, type SubagentBridgeContext } from './host/subagent-bridge.ts'
+import { ProcessManager } from './host/process-manager.ts'
+import { DaemonToolFacade } from './host/daemon-tool.ts'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-agy-link'
@@ -197,6 +199,12 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   if (logsSwept > 0) log('swept ' + logsSwept + ' old log file(s)')
   const cleanedMcp = cleanOrphanMcpConfigs({ dshHomeDir: dshHome(), log })
   if (cleanedMcp > 0) log('boot hygiene: cleaned ' + cleanedMcp + ' orphaned dsh_managed MCP config(s)')
+
+  const processManager = new ProcessManager({ log })
+  void processManager.cleanOrphanProcesses().catch((err) => {
+    log('failed to clean orphan processes: ' + String(err))
+  })
+  const daemonTool = new DaemonToolFacade(processManager)
 
   const adapter = new AgyAdapter({
     getConfig,
@@ -772,6 +780,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           const bridge = await startMcpBridge({
             bridgeScript: script,
             tools: () => (ctx.get('tools') as ToolsServiceLike | undefined),
+            internalTools: () => [daemonTool],
             allowlist: () => getConfig().mcpToolAllowlist,
             log,
           })
@@ -819,6 +828,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
       void poolAuth.cancel()
       void supervisor.dispose()
       subagentBridge.dispose()
+      void processManager.dispose().catch(() => undefined)
       if (askToolDispose.current !== null) askToolDispose.current()
       if (mirrorToolDispose.current !== null) mirrorToolDispose.current()
       bridgeState.restore?.()
