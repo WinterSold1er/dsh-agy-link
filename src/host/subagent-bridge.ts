@@ -34,7 +34,7 @@ export interface DshSession {
   readonly id: string
   readonly header?: DshSessionHeader
   readonly meta?: DshSessionMeta
-  append(type: string, data: unknown): void
+  append(type: string, data: unknown, opts?: { surfaceOp?: string | object; [key: string]: unknown }): unknown
 }
 
 export interface DshSessionManager {
@@ -162,6 +162,16 @@ export class SubagentBridge {
           this.sessions = s as DshSessionManager
         }
       } catch {}
+    }
+  }
+
+  private logError(context: string, err: unknown): void {
+    const message = err instanceof Error ? (err.stack || err.message) : String(err)
+    const fullMsg = `[subagent-bridge] ${context}: ${message}`
+    if (this.log) {
+      this.log(fullMsg)
+    } else {
+      console.error(fullMsg)
     }
   }
 
@@ -384,9 +394,9 @@ export class SubagentBridge {
           role: 'user',
           source: { kind: 'user' },
           content: [{ type: 'text', text: promptText || task || description || 'Subagent execution' }],
-        })
+        }, { surfaceOp: 'append' })
       } catch (err) {
-        this.log?.(`Failed to append subagent descriptor to child session: ${String(err)}`)
+        this.logError('Failed to initialize subagent turn and user/message in child session', err)
       }
     }
 
@@ -416,12 +426,39 @@ export class SubagentBridge {
     let carryover = ''
     let stopped = false
     let pollTimer: NodeJS.Timeout | null = null
-    let stepCounter = 1
+    let currentStep = 1
+    let stepIsOpen = false
     const decoder = new StringDecoder('utf8')
 
-    // Tool call / result FIFO pairing queue
+    // Tool call / result FIFO pairing queue and step tracking
     const pendingToolCallIds: string[] = []
+    const pendingCallsInStep = new Set<string>()
     let hasStreamedAssistantChunk = false
+    let accumulatedAssistantText = ''
+
+    const ensureStepOpen = () => {
+      if (!stepIsOpen && childSession?.append) {
+        try {
+          childSession.append('step/start', { turn: 1, step: currentStep })
+          stepIsOpen = true
+        } catch (err) {
+          this.logError('Failed to append step/start to child session', err)
+        }
+      }
+    }
+
+    const ensureStepClosed = () => {
+      if (stepIsOpen && childSession?.append) {
+        try {
+          childSession.append('step/end', { turn: 1, step: currentStep })
+          stepIsOpen = false
+          pendingCallsInStep.clear()
+          currentStep += 1
+        } catch (err) {
+          this.logError('Failed to append step/end to child session', err)
+        }
+      }
+    }
 
     const findTranscript = (): string | null => {
       const brainDir = defaultBrainDir(opts.accountHome)
@@ -478,9 +515,10 @@ export class SubagentBridge {
       try {
         // Thinking / reasoning
         if (typeof stepObj.thinking === 'string' && stepObj.thinking.length > 0) {
+          ensureStepOpen()
           childSession.append('assistant/chunk', {
             turn: 1,
-            step: stepCounter++,
+            step: currentStep,
             chunk: {
               type: 'reasoning-delta',
               index: 0,
@@ -491,16 +529,18 @@ export class SubagentBridge {
 
         // Tool calls
         if (Array.isArray(stepObj.tool_calls) && stepObj.tool_calls.length > 0) {
+          ensureStepOpen()
           for (const tc of stepObj.tool_calls) {
             if (tc && typeof tc === 'object') {
               const tcObj = tc as Record<string, unknown>
               const callName = String(tcObj.name ?? 'tool')
               const callArgs = typeof tcObj.args === 'string' ? tcObj.args : JSON.stringify(tcObj.args ?? {})
-              const callId = String(tcObj.id ?? tcObj.call_id ?? `agytc-sub-${stepCounter}`)
+              const callId = String(tcObj.id ?? tcObj.call_id ?? `agytc-sub-${randomUUID()}`)
               pendingToolCallIds.push(callId)
+              pendingCallsInStep.add(callId)
               childSession.append('tool/call', {
                 turn: 1,
-                step: stepCounter++,
+                step: currentStep,
                 callId,
                 name: callName,
                 arguments: callArgs,
@@ -508,11 +548,13 @@ export class SubagentBridge {
             }
           }
         } else if (stepObj.tool || stepObj.type === 'tool' || stepObj.tool_name) {
-          const callId = String(stepObj.call_id ?? stepObj.callId ?? `agytc-sub-${stepCounter}`)
+          ensureStepOpen()
+          const callId = String(stepObj.call_id ?? stepObj.callId ?? `agytc-sub-${randomUUID()}`)
           pendingToolCallIds.push(callId)
+          pendingCallsInStep.add(callId)
           childSession.append('tool/call', {
             turn: 1,
-            step: stepCounter++,
+            step: currentStep,
             callId,
             name: String(stepObj.tool ?? stepObj.tool_name ?? 'tool'),
             arguments: typeof stepObj.args === 'string' ? stepObj.args : JSON.stringify(stepObj.args ?? {}),
@@ -521,33 +563,87 @@ export class SubagentBridge {
 
         // Tool results (GENERIC or tool_result)
         if (stepObj.type === 'GENERIC' || stepObj.type === 'tool_result' || stepObj.event === 'tool_result') {
-          const resText = typeof stepObj.content === 'string'
-            ? stepObj.content
-            : typeof stepObj.output === 'string'
-            ? stepObj.output
-            : JSON.stringify(stepObj)
-          
           const rawCallId = stepObj.call_id ?? stepObj.callId ?? stepObj.tool_call_id
-          let matchedCallId: string
-          if (rawCallId !== undefined && rawCallId !== null && String(rawCallId).trim() !== '') {
-            matchedCallId = String(rawCallId)
-            const idx = pendingToolCallIds.indexOf(matchedCallId)
-            if (idx >= 0) {
-              pendingToolCallIds.splice(idx, 1)
-            }
-          } else if (pendingToolCallIds.length > 0) {
-            matchedCallId = pendingToolCallIds.shift()!
-          } else {
-            matchedCallId = `agytc-sub-${stepCounter}`
-          }
+          const hasExplicitCallId = rawCallId !== undefined && rawCallId !== null && String(rawCallId).trim() !== ''
 
-          childSession.append('tool/result', {
-            turn: 1,
-            step: stepCounter++,
-            callId: matchedCallId,
-            output: resText,
-            isError: stepObj.status === 'ERROR',
-          })
+          if (stepObj.type === 'GENERIC' && !hasExplicitCallId && pendingToolCallIds.length === 0) {
+            // Treat as regular text stream (assistant/chunk) - forbid forging fake tool/call ghost cards
+            const text = typeof stepObj.content === 'string'
+              ? stepObj.content
+              : typeof stepObj.output === 'string'
+              ? stepObj.output
+              : typeof stepObj.text === 'string'
+              ? stepObj.text
+              : undefined
+
+            if (text !== undefined && text.length > 0) {
+              hasStreamedAssistantChunk = true
+              accumulatedAssistantText += text.endsWith('\n') ? text : text + '\n'
+              ensureStepOpen()
+              childSession.append('assistant/chunk', {
+                turn: 1,
+                step: currentStep,
+                chunk: {
+                  type: 'text-delta',
+                  index: 0,
+                  text: text.endsWith('\n') ? text : text + '\n',
+                },
+              })
+            }
+          } else {
+            ensureStepOpen()
+            const resText = typeof stepObj.content === 'string'
+              ? stepObj.content
+              : typeof stepObj.output === 'string'
+              ? stepObj.output
+              : JSON.stringify(stepObj)
+            
+            let matchedCallId: string
+            if (hasExplicitCallId) {
+              matchedCallId = String(rawCallId)
+              const idx = pendingToolCallIds.indexOf(matchedCallId)
+              if (idx >= 0) {
+                pendingToolCallIds.splice(idx, 1)
+              }
+            } else if (pendingToolCallIds.length > 0) {
+              matchedCallId = pendingToolCallIds.shift()!
+            } else {
+              matchedCallId = `agytc-sub-${randomUUID()}`
+            }
+
+            // Invariant requirement: tool/result must pair with a prior tool/call in this open step
+            if (!pendingCallsInStep.has(matchedCallId)) {
+              childSession.append('tool/call', {
+                turn: 1,
+                step: currentStep,
+                callId: matchedCallId,
+                name: 'tool',
+                arguments: '{}',
+              })
+              pendingCallsInStep.add(matchedCallId)
+            }
+
+            childSession.append('tool/result', {
+              turn: 1,
+              step: currentStep,
+              callId: matchedCallId,
+              output: resText,
+              isError: stepObj.status === 'ERROR',
+              message: {
+                id: `msg-tool-${randomUUID()}`,
+                role: 'user',
+                source: { kind: 'tool', callId: matchedCallId },
+                content: [{
+                  type: 'tool-result',
+                  toolCallId: matchedCallId,
+                  content: [{ type: 'text', text: resText }],
+                  isError: stepObj.status === 'ERROR',
+                }],
+              },
+            }, { surfaceOp: 'append' })
+
+            pendingCallsInStep.delete(matchedCallId)
+          }
         }
 
         // Assistant response text (if not USER_INPUT and not GENERIC tool result)
@@ -570,9 +666,11 @@ export class SubagentBridge {
 
           if (text !== undefined && text.length > 0) {
             hasStreamedAssistantChunk = true
+            accumulatedAssistantText += text.endsWith('\n') ? text : text + '\n'
+            ensureStepOpen()
             childSession.append('assistant/chunk', {
               turn: 1,
-              step: stepCounter++,
+              step: currentStep,
               chunk: {
                 type: 'text-delta',
                 index: 0,
@@ -582,12 +680,20 @@ export class SubagentBridge {
           }
         }
       } catch (err) {
-        this.log?.(`Failed to append step to child session: ${String(err)}`)
+        this.logError('Failed to append step to child session', err)
       }
     }
 
     const isTerminalStep = (parsed: Record<string, unknown>): boolean => {
-      if (parsed.status === 'ERROR') return true
+      const isToolResult =
+        parsed.type === 'GENERIC' ||
+        parsed.type === 'tool_result' ||
+        parsed.event === 'tool_result'
+
+      if (parsed.status === 'ERROR') {
+        if (isToolResult) return false
+        return true
+      }
       if (parsed.event === 'result' || parsed.type === 'result' || parsed.type === 'final') return true
       if (
         (parsed.status === 'DONE' || parsed.status === 'COMPLETED') &&
@@ -652,8 +758,8 @@ export class SubagentBridge {
                       session.stop(errText, resText)
                       return
                     }
-                  } catch {
-                    // skip malformed line
+                  } catch (lineErr) {
+                    this.logError('Failed to parse and process transcript line in poll', lineErr)
                   }
                 }
               } else {
@@ -664,8 +770,8 @@ export class SubagentBridge {
             }
           }
         }
-      } catch {
-        // best effort polling
+      } catch (pollErr) {
+        this.logError('Transcript polling cycle encountered error', pollErr)
       }
       if (!stopped) {
         pollTimer = setTimeout(poll, hasMoreToRead ? 5 : 150)
@@ -748,7 +854,9 @@ export class SubagentBridge {
                           step: parsed,
                         })
                         appendStepToChildSession(parsed)
-                      } catch {}
+                      } catch (drainLineErr) {
+                        this.logError('Failed to parse drained transcript line on stop', drainLineErr)
+                      }
                     }
                   } else {
                     carryover = chunkStr
@@ -759,7 +867,9 @@ export class SubagentBridge {
               }
             }
           }
-        } catch {}
+        } catch (drainErr) {
+          this.logError('Failed to drain transcript file on stop', drainErr)
+        }
 
         if (carryover.trim()) {
           const remaining = carryover + decoder.end()
@@ -775,37 +885,55 @@ export class SubagentBridge {
                 step: parsed,
               })
               appendStepToChildSession(parsed)
-            } catch {}
+            } catch (resLineErr) {
+              this.logError('Failed to parse residual transcript line on stop', resLineErr)
+            }
           }
         }
 
         // Append final result and turn/end to DSH child session
         if (childSession?.append) {
           try {
-            if (resultText && !hasStreamedAssistantChunk) {
-              childSession.append('assistant/message', {
-                turn: 1,
-                step: stepCounter++,
-                surfaceOp: 'append',
-                message: {
-                  id: `msg-subagent-${randomUUID()}`,
-                  role: 'assistant',
-                  source: {
-                    kind: 'model',
-                    provider: 'antigravity',
-                    model: subagentModel,
+            try {
+              const finalText = (resultText && resultText.trim().length > 0)
+                ? resultText
+                : accumulatedAssistantText.trim()
+
+              if (finalText.length > 0) {
+                ensureStepOpen()
+                childSession.append('assistant/message', {
+                  turn: 1,
+                  step: currentStep,
+                  message: {
+                    id: `msg-subagent-${randomUUID()}`,
+                    role: 'assistant',
+                    source: {
+                      kind: 'model',
+                      provider: 'antigravity',
+                      model: subagentModel,
+                    },
+                    content: [{ type: 'text', text: finalText }],
                   },
-                  content: [{ type: 'text', text: resultText }],
-                },
-              })
+                }, { surfaceOp: 'append' })
+              }
+            } finally {
+              try {
+                ensureStepClosed()
+              } catch (stepCloseErr) {
+                this.logError('Failed to close step in child session on stop', stepCloseErr)
+              }
+              try {
+                const isAborted = error === 'aborted'
+                childSession.append('turn/end', {
+                  turn: 1,
+                  reason: { kind: isAborted ? 'aborted' : (error ? 'error' : 'completed') },
+                })
+              } catch (turnEndErr) {
+                this.logError('Failed to append turn/end to child session on stop', turnEndErr)
+              }
             }
-            const isAborted = error === 'aborted'
-            childSession.append('turn/end', {
-              turn: 1,
-              reason: { kind: isAborted ? 'aborted' : (error ? 'error' : 'completed') },
-            })
           } catch (err) {
-            this.log?.(`Failed to append terminal state to child session: ${String(err)}`)
+            this.logError('Failed to append terminal state to child session', err)
           }
         }
 
@@ -822,6 +950,12 @@ export class SubagentBridge {
         this.log?.(`Subagent completed: ${runId} (stopReason=${endPayload.stopReason})`)
         this.emitter?.emit('subagent/end', endPayload)
         this.activeSubagents.delete(runId)
+        if (opts.stepKey) {
+          this.sessionsByStepKey.delete(opts.stepKey)
+        }
+        if (conversationId) {
+          this.sessionsByConversationId.delete(conversationId)
+        }
         opts.onStop?.(session, error, resultText)
       },
     }

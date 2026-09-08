@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { SubagentBridge, defaultBrainDir, type DshSession, type DshSessionManager, uriToPath } from '../src/host/subagent-bridge.ts'
@@ -10,7 +10,7 @@ import { RunRecording } from '../src/host/recording.ts'
 interface MockSessionRecord {
   id: string
   meta: Record<string, unknown> | undefined
-  events: Array<{ type: string; data: unknown }>
+  events: Array<{ type: string; data: unknown; opts?: unknown }>
 }
 
 function createMockSessionManager(): {
@@ -27,8 +27,8 @@ function createMockSessionManager(): {
         id: rec.id,
         meta: rec.meta,
         header: rec.meta,
-        append(type: string, data: unknown) {
-          rec.events.push({ type, data })
+        append(type: string, data: unknown, opts?: unknown) {
+          rec.events.push({ type, data, opts })
         },
       }
     },
@@ -44,8 +44,8 @@ function createMockSessionManager(): {
         id: sessId,
         meta: rec.meta,
         header: rec.meta,
-        append(type: string, data: unknown) {
-          rec.events.push({ type, data })
+        append(type: string, data: unknown, opts?: unknown) {
+          rec.events.push({ type, data, opts })
         },
       }
     },
@@ -534,7 +534,7 @@ test('Subagent Pipeline E2E [High 4]: Direct path probing by conversationId avoi
   }
 })
 
-test('Subagent Pipeline E2E [High 5]: Suppress duplicate assistant/message when assistant/chunk was already streamed', async () => {
+test('Subagent Pipeline E2E [High 5]: Append authoritative assistant/message with surfaceOp: append for DSH surface projection even when streamed', async () => {
   const tmpRoot = mkdtempSync(join(tmpdir(), 'agy-doublewrite-e2e-'))
   const { manager: mockSessions, sessions } = createMockSessionManager()
   const bridge = new SubagentBridge({ sessions: mockSessions })
@@ -572,8 +572,19 @@ test('Subagent Pipeline E2E [High 5]: Suppress duplicate assistant/message when 
     const chunks = childRec.events.filter((e) => e.type === 'assistant/chunk')
     assert.ok(chunks.length > 0, 'Must have streamed assistant/chunk')
 
+    const stepStart = childRec.events.find((e) => e.type === 'step/start')
+    assert.ok(stepStart, 'Must append step/start before stream/assistant content')
+
+    const stepEnd = childRec.events.find((e) => e.type === 'step/end')
+    assert.ok(stepEnd, 'Must append step/end before turn/end')
+
+    const userMsg = childRec.events.find((e) => e.type === 'user/message')
+    assert.ok(userMsg, 'Must append user/message')
+    assert.deepEqual(userMsg.opts, { surfaceOp: 'append' }, 'user/message must carry surfaceOp: append')
+
     const messages = childRec.events.filter((e) => e.type === 'assistant/message')
-    assert.equal(messages.length, 0, 'Must NOT append duplicate assistant/message when text was already streamed')
+    assert.equal(messages.length, 1, 'Must append authoritative assistant/message for DSH surface projection')
+    assert.deepEqual((messages[0] as any).opts, { surfaceOp: 'append' }, 'assistant/message must carry surfaceOp: append')
 
     const turnEnd = childRec.events.find((e) => e.type === 'turn/end')
     assert.ok(turnEnd, 'Must append turn/end')
@@ -884,4 +895,160 @@ test('Subagent Pipeline E2E: Phase failure does not stall subsequent phases', as
     bridge.dispose()
     rmSync(tmpRoot, { recursive: true, force: true })
   }
+})
+
+test('Defect P1: Subagent tool result ERROR does not prematurely terminate subagent session', async () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'agy-tool-err-'))
+  const { manager: mockSessions } = createMockSessionManager()
+  const bridge = new SubagentBridge({ sessions: mockSessions })
+
+  try {
+    const logFile = join(tmpRoot, 'transcript-tool-err.jsonl')
+    // Tool call followed by non-fatal tool result ERROR (e.g. grep unmatched)
+    writeFileSync(logFile, JSON.stringify({
+      step_index: 1,
+      source: 'MODEL',
+      tool_calls: [{ id: 'tc-grep-1', name: 'grep', args: { pattern: 'nonexistent' } }],
+    }) + '\n' + JSON.stringify({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'ERROR',
+      call_id: 'tc-grep-1',
+      output: 'exit status 1: pattern not found',
+    }) + '\n', 'utf8')
+
+    const sub = bridge.startSubagent({
+      toolName: 'invoke_subagent',
+      toolArgs: { task: 'Search codebase' },
+      conversationId: 'cid-tool-err',
+      logAbsoluteUri: `file://${logFile}`,
+      stepKey: 'step-tool-err',
+    })
+
+    await new Promise((r) => setTimeout(r, 200))
+
+    // Verify subagent is STILL ACTIVE (not killed prematurely)
+    assert.strictEqual(sub.isStopped, false, 'Subagent must NOT be stopped by tool ERROR result')
+    assert.strictEqual(bridge.getActiveByConversationId('cid-tool-err')?.subagentId, sub.subagentId)
+
+    // Append genuine final response
+    appendFileSync(logFile, JSON.stringify({
+      step_index: 3,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'Finished searching, no matches found.',
+    }) + '\n', 'utf8')
+
+    await new Promise((r) => setTimeout(r, 200))
+
+    // Now it should be stopped properly
+    assert.strictEqual(sub.isStopped, true, 'Subagent stops only on terminal step')
+  } finally {
+    bridge.dispose()
+    rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('Defect P1: Subagent stop() cascades to close step and append turn/end even if assistant/message throws', () => {
+  const appendedEvents: Array<{ type: string; data: unknown }> = []
+  let stepClosed = false
+
+  const throwingSession: DshSession = {
+    id: 'mock-throwing-session',
+    append(type: string, data: unknown) {
+      appendedEvents.push({ type, data })
+      if (type === 'assistant/message') {
+        throw new Error('Disk full or serialization error on assistant/message')
+      }
+      if (type === 'step/end') {
+        stepClosed = true
+      }
+    },
+  }
+
+  const mockManager: DshSessionManager = {
+    create: () => throwingSession,
+  }
+
+  const bridge = new SubagentBridge({ sessions: mockManager })
+  const sub = bridge.startSubagent({
+    toolName: 'invoke_subagent',
+    toolArgs: { task: 'Test cascade' },
+    conversationId: 'cid-cascade',
+  })
+
+  // Calling stop() with result text triggers assistant/message, which will throw
+  sub.stop(undefined, 'Final text causing throw')
+
+  // Invariant check: step/end and turn/end MUST be appended despite throw
+  const turnEnd = appendedEvents.find((e) => e.type === 'turn/end')
+  assert.ok(turnEnd, 'turn/end MUST be appended via finally block')
+  assert.strictEqual((turnEnd?.data as { reason: { kind: string } }).reason.kind, 'completed')
+  assert.ok(stepClosed, 'step/end MUST be appended via ensureStepClosed in finally block')
+  bridge.dispose()
+})
+
+test('Defect P2: GENERIC step without call_id and empty pendingToolCallIds emits assistant/chunk without fake tool/call', async () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'agy-no-ghost-'))
+  const { manager: mockSessions, sessions } = createMockSessionManager()
+  const bridge = new SubagentBridge({ sessions: mockSessions })
+
+  try {
+    const logFile = join(tmpRoot, 'transcript-ghost.jsonl')
+    writeFileSync(logFile, JSON.stringify({
+      step_index: 1,
+      type: 'GENERIC',
+      content: 'Informational status message from agent',
+    }) + '\n', 'utf8')
+
+    bridge.startSubagent({
+      toolName: 'invoke_subagent',
+      toolArgs: { task: 'Ghost check' },
+      conversationId: 'cid-ghost',
+      logAbsoluteUri: `file://${logFile}`,
+    })
+
+    await new Promise((r) => setTimeout(r, 200))
+
+    const rec = sessions.get('agy-cid-ghost')
+    assert.ok(rec, 'Session must exist')
+
+    // Must NOT contain any forged tool/call
+    const toolCalls = rec.events.filter((e) => e.type === 'tool/call')
+    assert.strictEqual(toolCalls.length, 0, 'Must NOT forge fake tool/call card')
+
+    // Must be emitted as assistant/chunk
+    const chunks = rec.events.filter((e) => e.type === 'assistant/chunk')
+    assert.ok(chunks.length > 0, 'Must emit as assistant/chunk')
+    const text = chunks.map((c) => (c.data as { chunk: { text: string } }).chunk.text).join('')
+    assert.ok(text.includes('Informational status message from agent'))
+  } finally {
+    bridge.dispose()
+    rmSync(tmpRoot, { recursive: true, force: true })
+  }
+})
+
+test('Defect P2: Subagent session.stop() cleans up internal sessionsByStepKey and sessionsByConversationId maps', () => {
+  const { manager: mockSessions } = createMockSessionManager()
+  const bridge = new SubagentBridge({ sessions: mockSessions })
+
+  const sub = bridge.startSubagent({
+    toolName: 'invoke_subagent',
+    toolArgs: { task: 'Cleanup test' },
+    conversationId: 'conv-cleanup-test',
+    stepKey: 'step-cleanup-test',
+  })
+
+  // Pre-condition: active lookups resolve subagent
+  assert.strictEqual(bridge.getActiveByConversationId('conv-cleanup-test')?.subagentId, sub.subagentId)
+  assert.strictEqual(bridge.getActiveByStepKey('step-cleanup-test')?.subagentId, sub.subagentId)
+
+  // Act: stop subagent
+  sub.stop(undefined, 'All done')
+
+  // Post-condition: internal maps cleaned up, no zombie reuse
+  assert.strictEqual(bridge.getActiveByConversationId('conv-cleanup-test'), undefined, 'sessionsByConversationId must be cleaned up')
+  assert.strictEqual(bridge.getActiveByStepKey('step-cleanup-test'), undefined, 'sessionsByStepKey must be cleaned up')
+  bridge.dispose()
 })
