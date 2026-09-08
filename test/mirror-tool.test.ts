@@ -138,8 +138,8 @@ test('cursor-only invocations: execute + presenters resolve detail from the reco
 test('run_code wrapper round-trip: build -> parse recovers the cursor', () => {
   const built = buildMirrorRunCode('7d246c00-c0d1-4e3c-a25b-848881b81042', 15, 'run_command')
   assert.equal(built.description, 'replay agy tool step 15 · run_command')
-  assert.ok(built.code.includes("tools['agy_tool']({\"run\":\"7d246c00-c0d1-4e3c-a25b-848881b81042\",\"step\":15})"), built.code)
-  assert.deepEqual(parseMirrorInvocation(built.code), { run: '7d246c00-c0d1-4e3c-a25b-848881b81042', step: 15 })
+  assert.ok(built.code.includes("tools['agy_tool']({\"run\":\"7d246c00-c0d1-4e3c-a25b-848881b81042\",\"step\":15,\"tool\":\"run_command\"})"), built.code)
+  assert.deepEqual(parseMirrorInvocation(built.code), { run: '7d246c00-c0d1-4e3c-a25b-848881b81042', step: 15, tool: 'run_command' })
   assert.equal(parseMirrorInvocation('unrelated code'), null)
 })
 

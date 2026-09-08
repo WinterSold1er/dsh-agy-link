@@ -78,7 +78,7 @@ export function buildMirrorRunCode(
   eventIndex: number,
   toolName: string,
 ): { code: string; description: string } {
-  const invocation = JSON.stringify({ run: runId, step: eventIndex })
+  const invocation = JSON.stringify({ run: runId, step: eventIndex, tool: toolName })
   return {
     code:
       '// dsh-agy-link mirror: replay recorded agy tool step ' +
@@ -94,12 +94,16 @@ export function buildMirrorRunCode(
 }
 
 /** Extract the (run, step) cursor embedded by buildMirrorRunCode. */
-export function parseMirrorInvocation(code: string): { run: string; step: number } | null {
-  const m = /tools\['agy_tool'\]\((\{"run":.*?,"step":\d+\})\)/.exec(code)
+export function parseMirrorInvocation(code: string): { run: string; step: number; tool?: string } | null {
+  const m = /tools\['agy_tool'\]\((\{.*?\})\)/.exec(code)
   if (m === null) return null
   try {
-    const v = JSON.parse(m[1] as string) as { run?: unknown; step?: unknown }
-    if (typeof v.run === 'string' && typeof v.step === 'number') return { run: v.run, step: v.step }
+    const v = JSON.parse(m[1] as string) as { run?: unknown; step?: unknown; tool?: unknown }
+    if (typeof v.run === 'string' && typeof v.step === 'number') {
+      const res: { run: string; step: number; tool?: string } = { run: v.run, step: v.step }
+      if (typeof v.tool === 'string') res.tool = v.tool
+      return res
+    }
     return null
   } catch {
     return null
